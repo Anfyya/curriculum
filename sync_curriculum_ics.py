@@ -443,8 +443,8 @@ def _get_service_ticket(username: str, password: str, max_retries: int = 5) -> s
     ssl_ctx = _build_ssl_context()
     cas_name = "/lyuapServer"
     encrypted_pwd = _rsa_encrypt_block(password)
-    sso_timeout = _env_int("CURRICULUM_SSO_TIMEOUT", 30)
-    sso_net_retries = _env_int("CURRICULUM_SSO_NET_RETRIES", 3)
+    sso_timeout = _env_int("CURRICULUM_SSO_TIMEOUT", 20)
+    sso_net_retries = _env_int("CURRICULUM_SSO_NET_RETRIES", 2)
 
     for attempt in range(1, max_retries + 1):
         kaptcha_url = f"{_SSO_ORIGIN}{cas_name}/kaptcha?uid=&sf_request_type=ajax"
@@ -682,7 +682,7 @@ main().catch((e) => {
         out_path = f_out.name
 
     debug_port = str(int(os.getenv("CURRICULUM_CHROME_DEBUG_PORT", "9262")))
-    browser_timeout = max(90, _env_int("CURRICULUM_BROWSER_TIMEOUT", 180))
+    browser_timeout = max(60, _env_int("CURRICULUM_BROWSER_TIMEOUT", 120))
     result: dict
     try:
         subprocess.run(
@@ -755,7 +755,7 @@ def auto_login_cookie_via_browser(
 ) -> Tuple[str, str]:
     ticket = _get_service_ticket(username, password, max_retries=max_retries)
     callback_url = f"{_CAS_SERVICE}&ticket={urllib.parse.quote(ticket, safe='')}"
-    browser_retries = max(1, _env_int("CURRICULUM_BROWSER_RETRIES", 2))
+    browser_retries = max(1, _env_int("CURRICULUM_BROWSER_RETRIES", 1))
     last_err: Optional[Exception] = None
     for i in range(1, browser_retries + 1):
         try:
@@ -785,8 +785,8 @@ def auto_login_with_session(
     ocr = ddddocr.DdddOcr(show_ad=False)
     ssl_ctx = _build_ssl_context()
     target_host = (urllib.parse.urlsplit(entry_url).hostname or "").strip()
-    sso_timeout = _env_int("CURRICULUM_SSO_TIMEOUT", 30)
-    sso_net_retries = _env_int("CURRICULUM_SSO_NET_RETRIES", 3)
+    sso_timeout = _env_int("CURRICULUM_SSO_TIMEOUT", 20)
+    sso_net_retries = _env_int("CURRICULUM_SSO_NET_RETRIES", 2)
 
     cas_name = "/lyuapServer"
     encrypted_pwd = _rsa_encrypt_block(password)
@@ -920,8 +920,8 @@ def auto_login(username: str, password: str, max_retries: int = 5) -> str:
 
     ocr = ddddocr.DdddOcr(show_ad=False)
     ssl_ctx = _build_ssl_context()
-    sso_timeout = _env_int("CURRICULUM_SSO_TIMEOUT", 30)
-    sso_net_retries = _env_int("CURRICULUM_SSO_NET_RETRIES", 3)
+    sso_timeout = _env_int("CURRICULUM_SSO_TIMEOUT", 20)
+    sso_net_retries = _env_int("CURRICULUM_SSO_NET_RETRIES", 2)
 
     cas_name = "/lyuapServer"
     encrypted_pwd = _rsa_encrypt_block(password)
@@ -1109,8 +1109,8 @@ def request_json(
 ) -> dict:
     body = None
     req_headers = dict(headers)
-    api_timeout = _env_int("CURRICULUM_API_TIMEOUT", 40)
-    api_retries = _env_int("CURRICULUM_API_RETRIES", 3)
+    api_timeout = _env_int("CURRICULUM_API_TIMEOUT", 30)
+    api_retries = _env_int("CURRICULUM_API_RETRIES", 2)
     if data is not None:
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         req_headers["Content-Type"] = "application/json;charset=UTF-8"

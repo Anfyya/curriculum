@@ -34,20 +34,21 @@ jobs:
 
       - name: Build ICS
         env:
+          PYTHONUNBUFFERED: "1"
           CURRICULUM_ENTRY_URL: ${{ secrets.CURRICULUM_ENTRY_URL }}
           SSO_USERNAME: ${{ secrets.SSO_USERNAME }}
           SSO_PASSWORD: ${{ secrets.SSO_PASSWORD }}
           CURRICULUM_CHROME_BIN: /usr/bin/google-chrome
-          CURRICULUM_SSO_TIMEOUT: "45"
-          CURRICULUM_SSO_NET_RETRIES: "4"
-          CURRICULUM_API_TIMEOUT: "45"
-          CURRICULUM_API_RETRIES: "4"
-          CURRICULUM_BROWSER_TIMEOUT: "240"
-          CURRICULUM_BROWSER_RETRIES: "3"
+          CURRICULUM_SSO_TIMEOUT: "20"
+          CURRICULUM_SSO_NET_RETRIES: "2"
+          CURRICULUM_API_TIMEOUT: "30"
+          CURRICULUM_API_RETRIES: "2"
+          CURRICULUM_BROWSER_TIMEOUT: "120"
+          CURRICULUM_BROWSER_RETRIES: "1"
           CURRICULUM_OUTPUT: curriculum.ics
           CURRICULUM_CALENDAR_NAME: 课程表
         run: |
-          python sync_curriculum_ics.py
+          python -u sync_curriculum_ics.py
 
       - name: Commit and Push
         run: |
