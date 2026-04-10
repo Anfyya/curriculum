@@ -34,6 +34,16 @@ DEFAULT_PERIOD_TIMES = {
     14: ("23:35", "00:20"),
 }
 
+# 指定节次区间的时间覆盖（优先于 period_times.json）
+PERIOD_RANGE_OVERRIDES: Dict[Tuple[int, int], Tuple[str, str]] = {
+    (1, 2): ("08:30", "09:55"),
+    (3, 4): ("10:15", "11:40"),
+    (5, 6): ("14:00", "15:24"),
+    (7, 8): ("15:45", "17:10"),
+    (1, 4): ("08:30", "11:40"),
+    (5, 8): ("14:00", "17:10"),
+}
+
 # 系统 dayOfWeek 映射：2=星期一 ... 7=星期六, 1=星期日
 DAY_OFFSET_MAP = {1: 6, 2: 0, 3: 1, 4: 2, 5: 3, 6: 4, 7: 5}
 DAY_NAME_OFFSET_MAP = {
@@ -249,9 +259,49 @@ def fallback_period_time(period: int) -> Tuple[str, str]:
 
 
 def period_range_time(start_period: int, end_period: int, period_map: Dict[int, Tuple[str, str]]) -> Tuple[str, str]:
+    override = PERIOD_RANGE_OVERRIDES.get((start_period, end_period))
+    if override:
+        return override
     st = period_map.get(start_period, fallback_period_time(start_period))[0]
     et = period_map.get(end_period, fallback_period_time(end_period))[1]
     return st, et
+
+
+def periods_to_blocks(periods: Iterable[int]) -> List[Tuple[int, int]]:
+    # 先识别成对节次，再保留剩余单节
+    s = set(p for p in periods if p > 0)
+    blocks: List[Tuple[int, int]] = []
+    for a, b in ((1, 2), (3, 4), (5, 6), (7, 8)):
+        if a in s and b in s:
+            blocks.append((a, b))
+            s.remove(a)
+            s.remove(b)
+    for p in sorted(s):
+        blocks.append((p, p))
+    return blocks
+
+
+def merge_blocks_with_rule(blocks: Iterable[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    # 仅允许 1-2+3-4 => 1-4，5-6+7-8 => 5-8
+    block_set = set(blocks)
+    merged: List[Tuple[int, int]] = []
+    if (1, 2) in block_set and (3, 4) in block_set:
+        merged.append((1, 4))
+        block_set.remove((1, 2))
+        block_set.remove((3, 4))
+    if (5, 6) in block_set and (7, 8) in block_set:
+        merged.append((5, 8))
+        block_set.remove((5, 6))
+        block_set.remove((7, 8))
+    merged.extend(sorted(block_set, key=lambda x: (x[0], x[1])))
+    merged.sort(key=lambda x: (x[0], x[1]))
+    return merged
+
+
+def split_names(raw: str) -> List[str]:
+    if not raw:
+        return []
+    return [x.strip() for x in re.split(r"[、,，\s]+", raw) if x.strip()]
 
 
 def parse_hhmm_to_dt(d: date, hhmm: str) -> datetime:
@@ -722,7 +772,9 @@ def build_ics(config: Config) -> Tuple[str, int]:
 
     current_week_monday = today_date - timedelta(days=today_date.weekday())
 
-    grouped: Dict[Tuple[str, str, str, int, str, str], set] = {}
+    grouped_blocks: Dict[Tuple[str, str, int, int], set] = {}
+    grouped_teachers: Dict[Tuple[str, str, int, int], List[str]] = {}
+    grouped_classes: Dict[Tuple[str, str, int, int], List[str]] = {}
     for r in rows:
         offset = day_offset(r)
         if offset is None:
@@ -732,8 +784,12 @@ def build_ics(config: Config) -> Tuple[str, int]:
         teacher = normalize_teacher(str(r.get("teacherName") or "").strip())
         classroom = re.sub(r"\s+", " ", str(r.get("classroomName") or "").strip())
         class_name = str(r.get("teachingClassName") or r.get("className") or "").strip()
-        # 单周查询时，优先用请求周号，避免使用接口返回的聚合周次字符串
-        weeks_expr = str(r.get("_week_code") or r.get("weeks") or "").strip()
+        week_num = safe_int(r.get("_week_code"))
+        if week_num is None:
+            parsed = parse_weeks_expr(str(r.get("weeks") or "").strip(), max_week)
+            if not parsed:
+                continue
+            week_num = parsed[0]
 
         periods = parse_periods(r.get("time"))
         if not periods:
@@ -741,46 +797,60 @@ def build_ics(config: Config) -> Tuple[str, int]:
         if not periods:
             continue
 
-        key = (course, teacher, classroom, offset, weeks_expr, class_name)
-        grouped.setdefault(key, set()).update(periods)
+        block_ranges = periods_to_blocks(periods)
+        if not block_ranges:
+            continue
+
+        # 合并键只看课程+教室+星期+周次；不同教室天然拆分
+        key = (course, classroom, offset, week_num)
+        grouped_blocks.setdefault(key, set()).update(block_ranges)
+
+        teacher_list = grouped_teachers.setdefault(key, [])
+        for t in split_names(teacher):
+            if t not in teacher_list:
+                teacher_list.append(t)
+
+        class_list = grouped_classes.setdefault(key, [])
+        if class_name and class_name not in class_list:
+            class_list.append(class_name)
 
     events = []
-    for (course, teacher, classroom, offset, weeks_expr, class_name), period_set in grouped.items():
-        week_nums = parse_weeks_expr(weeks_expr, max_week)
-        if not week_nums:
-            week_nums = [current_week]
+    for (course, classroom, offset, week_num), block_set in grouped_blocks.items():
+        period_ranges = merge_blocks_with_rule(block_set)
+        day_date = current_week_monday + timedelta(days=offset + (week_num - current_week) * 7)
+        weeks_expr = str(week_num)
+        teacher = "、".join(grouped_teachers.get((course, classroom, offset, week_num), []))
+        class_name = "、".join(grouped_classes.get((course, classroom, offset, week_num), []))
 
-        period_ranges = merge_periods(period_set)
-        for wn in week_nums:
-            day_date = current_week_monday + timedelta(days=offset + (wn - current_week) * 7)
-            for start_p, end_p in period_ranges:
-                st_s, et_s = period_range_time(start_p, end_p, config.period_times)
-                dt_start = parse_hhmm_to_dt(day_date, st_s)
-                dt_end = parse_hhmm_to_dt(day_date, et_s)
-                if dt_end <= dt_start:
-                    dt_end += timedelta(days=1)
+        for start_p, end_p in period_ranges:
+            st_s, et_s = period_range_time(start_p, end_p, config.period_times)
+            dt_start = parse_hhmm_to_dt(day_date, st_s)
+            dt_end = parse_hhmm_to_dt(day_date, et_s)
+            if dt_end <= dt_start:
+                dt_end += timedelta(days=1)
 
-                summary = course
-                location = classroom or "待定教室"
-                desc = "\n".join([
-                    f"教师: {teacher or '待定'}",
-                    f"班级: {class_name or '待定'}",
-                    f"周次规则: {weeks_expr or str(wn)}",
-                    f"节次: 第{start_p}-{end_p}节",
-                    f"学期: {semester}",
-                    "来源: 江西工程学院课程系统",
-                ])
+            # Apple 日历列表可见位置展示教师名
+            summary = course if not teacher else f"{course}（{teacher}）"
+            location = classroom or "待定教室"
+            desc = "\n".join([
+                f"教师: {teacher or '待定'}",
+                f"班级: {class_name or '待定'}",
+                f"周次规则: {weeks_expr}",
+                f"节次: 第{start_p}-{end_p}节",
+                f"学期: {semester}",
+                "来源: 江西工程学院课程系统",
+            ])
 
-                uid_seed = f"{course}|{teacher}|{classroom}|{day_date.isoformat()}|{start_p}-{end_p}|{weeks_expr}"
-                uid = hashlib.sha1(uid_seed.encode("utf-8")).hexdigest() + "@curriculum"
-                events.append((dt_start, {
-                    "uid": uid,
-                    "start": dt_start,
-                    "end": dt_end,
-                    "summary": summary,
-                    "location": location,
-                    "description": desc,
-                }))
+            uid_seed = f"{course}|{teacher}|{classroom}|{day_date.isoformat()}|{start_p}-{end_p}|{weeks_expr}"
+            uid = hashlib.sha1(uid_seed.encode("utf-8")).hexdigest() + "@curriculum"
+            events.append((dt_start, {
+                "uid": uid,
+                "start": dt_start,
+                "end": dt_end,
+                "summary": summary,
+                "location": location,
+                "description": desc,
+            }))
 
     events.sort(key=lambda x: x[0])
     dtstamp = datetime.now(TZ_UTC).strftime("%Y%m%dT%H%M%SZ")
