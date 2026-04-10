@@ -1,0 +1,46 @@
+﻿name: Sync Curriculum ICS
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build ICS
+        env:
+          CURRICULUM_ENTRY_URL: ${{ secrets.CURRICULUM_ENTRY_URL }}
+          CURRICULUM_COOKIE: ${{ secrets.CURRICULUM_COOKIE }}
+          CURRICULUM_ACCESS_TOKEN: ${{ secrets.CURRICULUM_ACCESS_TOKEN }}
+          CURRICULUM_USER_ID: ${{ secrets.CURRICULUM_USER_ID }}
+          CURRICULUM_USER_TYPE: ${{ secrets.CURRICULUM_USER_TYPE }}
+          CURRICULUM_OUTPUT: curriculum.ics
+          CURRICULUM_CALENDAR_NAME: 课程表
+        run: |
+          python sync_curriculum_ics.py
+
+      - name: Commit and Push
+        run: |
+          if git diff --quiet -- curriculum.ics; then
+            echo "curriculum.ics 无变化"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add curriculum.ics
+          git commit -m "v0.2 自动同步课程表 $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
