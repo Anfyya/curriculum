@@ -52,13 +52,13 @@ jobs:
 
       - name: Commit and Push
         run: |
-          if git diff --quiet -- curriculum.ics; then
+          git add curriculum.ics
+          if git diff --cached --quiet -- curriculum.ics; then
             echo "curriculum.ics 无变化"
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add curriculum.ics
-          git commit -m "v1.0 自动同步课程表 $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git commit -m "自动同步课程表 $(date -u +'%Y-%m-%d %H:%M UTC')"
           git push
