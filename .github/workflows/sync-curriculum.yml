@@ -26,29 +26,18 @@ jobs:
       - name: Install dependencies
         run: pip install ddddocr
 
-      - name: Check browser runtime
-        run: |
-          node -v
-          which google-chrome || true
-          google-chrome --version || true
-
       - name: Build ICS
         env:
-          PYTHONUNBUFFERED: "1"
           CURRICULUM_ENTRY_URL: ${{ secrets.CURRICULUM_ENTRY_URL }}
+          CURRICULUM_ACCESS_TOKEN: ${{ secrets.CURRICULUM_ACCESS_TOKEN }}
+          CURRICULUM_USER_ID: ${{ secrets.CURRICULUM_USER_ID }}
+          CURRICULUM_USER_TYPE: ${{ secrets.CURRICULUM_USER_TYPE }}
           SSO_USERNAME: ${{ secrets.SSO_USERNAME }}
           SSO_PASSWORD: ${{ secrets.SSO_PASSWORD }}
-          CURRICULUM_CHROME_BIN: /usr/bin/google-chrome
-          CURRICULUM_SSO_TIMEOUT: "20"
-          CURRICULUM_SSO_NET_RETRIES: "2"
-          CURRICULUM_API_TIMEOUT: "30"
-          CURRICULUM_API_RETRIES: "2"
-          CURRICULUM_BROWSER_TIMEOUT: "120"
-          CURRICULUM_BROWSER_RETRIES: "1"
           CURRICULUM_OUTPUT: curriculum.ics
           CURRICULUM_CALENDAR_NAME: 课程表
         run: |
-          python -u sync_curriculum_ics.py
+          python sync_curriculum_ics.py
 
       - name: Commit and Push
         run: |
@@ -60,5 +49,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add curriculum.ics
-          git commit -m "v1.4 自动同步课程表 $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git commit -m "v1.0 自动同步课程表 $(date -u +'%Y-%m-%d %H:%M UTC')"
           git push
