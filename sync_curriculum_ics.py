@@ -99,6 +99,17 @@ def env(name: str, default: Optional[str] = None, required: bool = False) -> str
     return "" if val is None else str(val)
 
 
+def normalize_entry_url(entry_url: str) -> str:
+    normalized = html.unescape((entry_url or "").strip()).replace("&amp;", "&")
+    if not normalized:
+        return ""
+    split = urllib.parse.urlsplit(normalized)
+    path = urllib.parse.quote(split.path, safe="/%:@!$&'()*+,;=-._~")
+    query = urllib.parse.quote(split.query, safe="=&%:@!$'()*+,;/?-._~")
+    fragment = urllib.parse.quote(split.fragment, safe="=&%:@!$'()*+,;/?-._~")
+    return urllib.parse.urlunsplit((split.scheme, split.netloc, path, query, fragment))
+
+
 def parse_entry(entry_url: str) -> Dict[str, str]:
     normalized = html.unescape((entry_url or "").strip()).replace("&amp;", "&")
     q = urllib.parse.parse_qs(urllib.parse.urlsplit(normalized).query)
@@ -425,8 +436,9 @@ def auto_login(username: str, password: str, max_retries: int = 5) -> str:
 
 
 def build_config() -> Config:
-    entry_url = env("CURRICULUM_ENTRY_URL", required=True)
-    parsed = parse_entry(entry_url)
+    entry_url_raw = env("CURRICULUM_ENTRY_URL", required=True)
+    entry_url = normalize_entry_url(entry_url_raw)
+    parsed = parse_entry(entry_url_raw)
 
     access_token = env("CURRICULUM_ACCESS_TOKEN", parsed.get("accessToken") or "", required=False).strip()
     if not access_token:
