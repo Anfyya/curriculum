@@ -26,6 +26,17 @@ jobs:
       - name: Install dependencies
         run: pip install ddddocr
 
+      - name: Network diagnostics (临时调试)
+        run: |
+          echo "=== DNS ==="
+          dig +short sso.jxec.edu.cn || nslookup sso.jxec.edu.cn || true
+          echo "=== Curl SSO (10s timeout) ==="
+          curl -sk --connect-timeout 10 -o /dev/null -w "status=%{http_code} time=%{time_total}s ip=%{remote_ip}\n" "https://sso.jxec.edu.cn:10445/lyuapServer/loginType?sf_request_type=ajax" || echo "CURL FAILED: $?"
+          echo "=== Curl Portal (10s timeout) ==="
+          curl -sk --connect-timeout 10 -o /dev/null -w "status=%{http_code} time=%{time_total}s ip=%{remote_ip}\n" "https://0xr.jxec.edu.cn:10443/" || echo "CURL FAILED: $?"
+          echo "=== Curl Curriculum (10s timeout) ==="
+          curl -sk --connect-timeout 10 -o /dev/null -w "status=%{http_code} time=%{time_total}s ip=%{remote_ip}\n" "https://zichan.jxec.edu.cn:14340/" || echo "CURL FAILED: $?"
+
       - name: Build ICS
         env:
           CURRICULUM_ENTRY_URL: ${{ secrets.CURRICULUM_ENTRY_URL }}
