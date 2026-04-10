@@ -241,12 +241,13 @@ def load_period_map() -> Dict[int, Tuple[str, str]]:
     # 优先环境变量，其次仓库内 period_times.json，最后默认值
     inline = os.getenv("CURRICULUM_PERIOD_TIMES_JSON", "").strip()
     if inline:
-        obj = json.loads(inline)
+        obj = json.loads(inline.lstrip("\ufeff"))
         return {int(k): (str(v[0]), str(v[1])) for k, v in obj.items()}
 
     path = os.getenv("CURRICULUM_PERIOD_TIMES_FILE", "period_times.json")
     if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
+        # 兼容带 UTF-8 BOM 的 JSON 文件
+        with open(path, "r", encoding="utf-8-sig") as f:
             obj = json.load(f)
         return {int(k): (str(v[0]), str(v[1])) for k, v in obj.items()}
 
@@ -292,7 +293,8 @@ def request_json(origin: str, headers: Dict[str, str], method: str, path: str, d
 
     req = urllib.request.Request(origin + path, data=body, headers=req_headers, method=method)
     with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = resp.read().decode("utf-8", "replace")
+        # 兼容接口返回体带 UTF-8 BOM
+        raw = resp.read().decode("utf-8-sig", "replace").lstrip("\ufeff")
         ct = (resp.headers.get("Content-Type") or "").lower()
 
     if "json" not in ct and not raw.strip().startswith("{"):
