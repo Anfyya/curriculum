@@ -1,5 +1,6 @@
 ﻿#!/usr/bin/env python3
 import hashlib
+import html
 import json
 import os
 import re
@@ -75,11 +76,21 @@ def env(name: str, default: Optional[str] = None, required: bool = False) -> str
 
 
 def parse_entry(entry_url: str) -> Dict[str, str]:
-    q = urllib.parse.parse_qs(urllib.parse.urlsplit(entry_url).query)
+    # 兼容从网页复制出来的 URL（可能包含 &amp;）
+    normalized = html.unescape((entry_url or "").strip()).replace("&amp;", "&")
+    q = urllib.parse.parse_qs(urllib.parse.urlsplit(normalized).query)
+
+    def first(*keys: str) -> str:
+        for key in keys:
+            vals = q.get(key)
+            if vals and vals[0]:
+                return vals[0]
+        return ""
+
     return {
-        "accessToken": (q.get("accessToken") or [""])[0],
-        "id": (q.get("id") or [""])[0],
-        "userType": (q.get("userType") or [""])[0],
+        "accessToken": first("accessToken", "amp;accessToken"),
+        "id": first("id", "amp;id"),
+        "userType": first("userType", "amp;userType"),
     }
 
 
@@ -218,9 +229,15 @@ def build_config() -> Config:
     entry_url = env("CURRICULUM_ENTRY_URL", required=True)
     parsed = parse_entry(entry_url)
 
-    access_token = env("CURRICULUM_ACCESS_TOKEN", parsed.get("accessToken") or "", required=True)
-    user_id = env("CURRICULUM_USER_ID", parsed.get("id") or "", required=True)
-    user_type = env("CURRICULUM_USER_TYPE", parsed.get("userType") or "0", required=True)
+    access_token = env("CURRICULUM_ACCESS_TOKEN", parsed.get("accessToken") or "", required=False).strip()
+    if not access_token:
+        raise RuntimeError("缺少 accessToken：请设置 CURRICULUM_ACCESS_TOKEN，或在 CURRICULUM_ENTRY_URL 中带上 accessToken 参数")
+
+    user_id = env("CURRICULUM_USER_ID", parsed.get("id") or "", required=False).strip()
+    if not user_id:
+        raise RuntimeError("缺少 userId：请设置 CURRICULUM_USER_ID，或在 CURRICULUM_ENTRY_URL 中带上 id 参数")
+
+    user_type = env("CURRICULUM_USER_TYPE", parsed.get("userType") or "0", required=False).strip() or "0"
 
     cookie = env("CURRICULUM_COOKIE", required=True)
     output_path = env("CURRICULUM_OUTPUT", "curriculum.ics")
