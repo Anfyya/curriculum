@@ -1,9 +1,12 @@
-﻿name: Sync Curriculum ICS
+name: Sync Curriculum ICS
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "30 23 * * 0-4"  # 北京时间工作日 07:30
+    - cron: "0 5 * * 1-5"    # 北京时间工作日 13:00
+    - cron: "0 10 * * 1-5"   # 北京时间工作日 18:00
+    - cron: "0 15 * * 1-5"   # 北京时间工作日 23:00
 
 permissions:
   contents: write
@@ -20,13 +23,17 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install dependencies
+        run: pip install ddddocr
+
       - name: Build ICS
         env:
           CURRICULUM_ENTRY_URL: ${{ secrets.CURRICULUM_ENTRY_URL }}
-          CURRICULUM_COOKIE: ${{ secrets.CURRICULUM_COOKIE }}
           CURRICULUM_ACCESS_TOKEN: ${{ secrets.CURRICULUM_ACCESS_TOKEN }}
           CURRICULUM_USER_ID: ${{ secrets.CURRICULUM_USER_ID }}
           CURRICULUM_USER_TYPE: ${{ secrets.CURRICULUM_USER_TYPE }}
+          SSO_USERNAME: ${{ secrets.SSO_USERNAME }}
+          SSO_PASSWORD: ${{ secrets.SSO_PASSWORD }}
           CURRICULUM_OUTPUT: curriculum.ics
           CURRICULUM_CALENDAR_NAME: 课程表
         run: |
@@ -42,5 +49,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add curriculum.ics
-          git commit -m "v0.2 自动同步课程表 $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git commit -m "v1.0 自动同步课程表 $(date -u +'%Y-%m-%d %H:%M UTC')"
           git push
