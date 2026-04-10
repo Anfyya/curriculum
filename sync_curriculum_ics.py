@@ -445,7 +445,84 @@ def auto_login(username: str, password: str, entry_url: str = "", max_retries: i
         portal_cookies = {c.name: c for c in cj}
         print(f"  门户 Cookie ({len(portal_cookies)} 项): {list(portal_cookies.keys())}")
 
-        # --- 5. 访问课表入口 URL，跟着 aTrust 重定向拿到目标域名的 sdp_app_session ---
+        # --- 5. 激活门户会话 (secondary_auth → online) ---
+        #  注意: 请求中不能带 x-sdp-traceid 头，否则网关会在 secondary_auth 状态下返回 401
+        _portal_host = urllib.parse.urlsplit(_PORTAL_ORIGIN).netloc
+        _x_sdp_rid = base64.b64encode(_portal_host.encode()).decode()
+        _base_params = {"clientType": "SDPBrowserClient", "platform": "Windows", "lang": "zh-CN"}
+
+        def _portal_api(method, path, params=None, body=None, csrf=""):
+            url = f"{_PORTAL_ORIGIN}{path}"
+            if params:
+                url += "?" + urllib.parse.urlencode(params)
+            hdrs = {**_UA, "Accept": "application/json, text/plain, */*",
+                    "Referer": f"{_PORTAL_ORIGIN}/portal/shortcut.html",
+                    "Origin": _PORTAL_ORIGIN, "x-sdp-rid": _x_sdp_rid}
+            if csrf:
+                hdrs["x-csrf-token"] = csrf
+            raw_body = None
+            if body is not None:
+                raw_body = json.dumps(body).encode()
+                hdrs["Content-Type"] = "application/json"
+            r = urllib.request.Request(url, data=raw_body, method=method, headers=hdrs)
+            try:
+                rsp = opener.open(r, timeout=15)
+                return rsp.status, json.loads(rsp.read().decode("utf-8", errors="replace"))
+            except urllib.error.HTTPError as e:
+                txt = e.read().decode("utf-8", errors="replace") if e.fp else ""
+                try:
+                    return e.code, json.loads(txt)
+                except Exception:
+                    return e.code, {"raw": txt[:300]}
+
+        # 5a. 获取 CSRF token
+        st, cfg = _portal_api("GET", "/passport/v1/public/authConfig",
+                              {"mod": "1", "sfDomain": "1", **_base_params})
+        csrf_token = ""
+        if st == 200 and isinstance(cfg.get("data"), dict):
+            csrf_token = cfg["data"].get("security", {}).get("csrfToken", "")
+        print(f"  authConfig: status={st}, CSRF={'OK' if csrf_token else 'MISSING'}")
+
+        # 5b. reportEnv (上报浏览器环境)
+        import random as _rnd, time as _tm
+        _dev_id = hashlib.md5(f"{_rnd.random()}{_tm.time()}".encode()).hexdigest()
+        _portal_ticket = ""
+        for _c in cj:
+            if _c.name == "sid":
+                _portal_ticket = _c.value
+                break
+        st2, _ = _portal_api("POST", "/controller/v1/public/reportEnv",
+                             params=_base_params, csrf=csrf_token,
+                             body={"ticket": _portal_ticket, "deviceId": _dev_id,
+                                   "env": {"endpoint": {"device_id": _dev_id,
+                                                        "device": {"type": "browser"}}}})
+        print(f"  reportEnv: status={st2}")
+
+        # 5c. authCheck → 获取 sidTicket
+        st3, ac_resp = _portal_api("GET", "/passport/v1/auth/authCheck",
+                                   params=_base_params, csrf=csrf_token)
+        sid_ticket = ""
+        if st3 == 200 and isinstance(ac_resp.get("data"), dict):
+            sid_ticket = ac_resp["data"].get("sidTicket", "")
+        print(f"  authCheck: status={st3}, sidTicket={'OK' if sid_ticket else 'MISSING'}")
+
+        # 5d. sessionIdExchange → 激活会话
+        if sid_ticket:
+            st4, ex_resp = _portal_api("POST", "/passport/v1/public/sessionIdExchange",
+                                       params=_base_params, csrf=csrf_token,
+                                       body={"sidTicket": sid_ticket})
+            print(f"  sessionIdExchange: status={st4}")
+        else:
+            print(f"  跳过 sessionIdExchange (无 sidTicket)")
+
+        # 检查会话状态
+        auth_tag = ""
+        for _c in cj:
+            if _c.name == "sdp_limit_auth_tag":
+                auth_tag = _c.value
+        print(f"  会话状态: sdp_limit_auth_tag={auth_tag}")
+
+        # --- 6. 访问课表入口 URL，跟着 aTrust 重定向拿到目标域名的 sdp_app_session ---
         if entry_url:
             target_host = urllib.parse.urlsplit(entry_url).hostname  # e.g. zichan.jxec.edu.cn
             print(f"  正在建立 {target_host} 的会话 (跟随 aTrust 重定向)...")
