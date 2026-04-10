@@ -38,6 +38,12 @@ jobs:
           SSO_USERNAME: ${{ secrets.SSO_USERNAME }}
           SSO_PASSWORD: ${{ secrets.SSO_PASSWORD }}
           CURRICULUM_CHROME_BIN: /usr/bin/google-chrome
+          CURRICULUM_SSO_TIMEOUT: "45"
+          CURRICULUM_SSO_NET_RETRIES: "4"
+          CURRICULUM_API_TIMEOUT: "45"
+          CURRICULUM_API_RETRIES: "4"
+          CURRICULUM_BROWSER_TIMEOUT: "240"
+          CURRICULUM_BROWSER_RETRIES: "3"
           CURRICULUM_OUTPUT: curriculum.ics
           CURRICULUM_CALENDAR_NAME: 课程表
         run: |
@@ -53,5 +59,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add curriculum.ics
-          git commit -m "v1.0 自动同步课程表 $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git commit -m "v1.4 自动同步课程表 $(date -u +'%Y-%m-%d %H:%M UTC')"
           git push

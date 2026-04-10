@@ -7,10 +7,12 @@ import json
 import os
 import re
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -343,6 +345,74 @@ def _build_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+def _is_retryable_error(err: Exception) -> bool:
+    if isinstance(err, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(err, urllib.error.URLError):
+        reason = getattr(err, "reason", None)
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            return True
+        msg = str(reason or err).lower()
+        retry_tokens = (
+            "timed out",
+            "temporarily unavailable",
+            "connection reset",
+            "connection aborted",
+            "network is unreachable",
+            "name or service not known",
+            "connection refused",
+        )
+        return any(t in msg for t in retry_tokens)
+    return False
+
+
+def _open_with_retry(
+    req: urllib.request.Request,
+    *,
+    opener: Optional[urllib.request.OpenerDirector] = None,
+    context: Optional[ssl.SSLContext] = None,
+    timeout: int = 30,
+    retries: int = 3,
+    label: str = "request",
+):
+    retries = max(1, retries)
+    last_err: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            if opener is not None:
+                return opener.open(req, timeout=timeout)
+            if context is not None:
+                return urllib.request.urlopen(req, timeout=timeout, context=context)
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if attempt < retries and e.code in (408, 429, 500, 502, 503, 504):
+                wait_s = min(1.0 + attempt * 0.8, 4.0)
+                print(f"  {label} HTTP {e.code}，重试 {attempt}/{retries} ...")
+                time.sleep(wait_s)
+                continue
+            raise
+        except Exception as e:
+            last_err = e
+            if attempt >= retries or not _is_retryable_error(e):
+                raise
+            wait_s = min(1.0 + attempt * 0.8, 4.0)
+            print(f"  {label} 网络异常，重试 {attempt}/{retries}: {e}")
+            time.sleep(wait_s)
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(f"{label} 请求失败")
+
+
 def _domain_matches(host: str, cookie_domain: str) -> bool:
     if not host or not cookie_domain:
         return False
@@ -373,11 +443,19 @@ def _get_service_ticket(username: str, password: str, max_retries: int = 5) -> s
     ssl_ctx = _build_ssl_context()
     cas_name = "/lyuapServer"
     encrypted_pwd = _rsa_encrypt_block(password)
+    sso_timeout = _env_int("CURRICULUM_SSO_TIMEOUT", 30)
+    sso_net_retries = _env_int("CURRICULUM_SSO_NET_RETRIES", 3)
 
     for attempt in range(1, max_retries + 1):
         kaptcha_url = f"{_SSO_ORIGIN}{cas_name}/kaptcha?uid=&sf_request_type=ajax"
         req = urllib.request.Request(kaptcha_url)
-        with urllib.request.urlopen(req, timeout=15, context=ssl_ctx) as resp:
+        with _open_with_retry(
+            req,
+            context=ssl_ctx,
+            timeout=sso_timeout,
+            retries=sso_net_retries,
+            label="kaptcha",
+        ) as resp:
             kdata = json.loads(resp.read().decode("utf-8-sig"))
 
         uid = kdata["uid"]
@@ -407,7 +485,13 @@ def _get_service_ticket(username: str, password: str, max_retries: int = 5) -> s
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             },
         )
-        with urllib.request.urlopen(req, timeout=15, context=ssl_ctx) as resp:
+        with _open_with_retry(
+            req,
+            context=ssl_ctx,
+            timeout=sso_timeout,
+            retries=sso_net_retries,
+            label="sso_login",
+        ) as resp:
             login_body = resp.read().decode("utf-8-sig")
         login_resp = json.loads(login_body)
 
@@ -598,6 +682,7 @@ main().catch((e) => {
         out_path = f_out.name
 
     debug_port = str(int(os.getenv("CURRICULUM_CHROME_DEBUG_PORT", "9262")))
+    browser_timeout = max(90, _env_int("CURRICULUM_BROWSER_TIMEOUT", 180))
     result: dict
     try:
         subprocess.run(
@@ -606,7 +691,7 @@ main().catch((e) => {
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=120,
+            timeout=browser_timeout,
         )
     except subprocess.CalledProcessError as e:
         stderr_tail = (e.stderr or "").strip()[-1600:]
@@ -619,7 +704,7 @@ main().catch((e) => {
         raise RuntimeError(f"浏览器登录子进程失败: {details}") from e
     except subprocess.TimeoutExpired as e:
         stderr_tail = (e.stderr or "").strip()[-1600:] if isinstance(e.stderr, str) else ""
-        raise RuntimeError(f"浏览器登录子进程超时(120s){', stderr=' + stderr_tail if stderr_tail else ''}") from e
+        raise RuntimeError(f"浏览器登录子进程超时({browser_timeout}s){', stderr=' + stderr_tail if stderr_tail else ''}") from e
     try:
         with open(out_path, "r", encoding="utf-8") as f:
             result = json.load(f)
@@ -670,7 +755,20 @@ def auto_login_cookie_via_browser(
 ) -> Tuple[str, str]:
     ticket = _get_service_ticket(username, password, max_retries=max_retries)
     callback_url = f"{_CAS_SERVICE}&ticket={urllib.parse.quote(ticket, safe='')}"
-    return _browser_cookie_login(callback_url, entry_url)
+    browser_retries = max(1, _env_int("CURRICULUM_BROWSER_RETRIES", 2))
+    last_err: Optional[Exception] = None
+    for i in range(1, browser_retries + 1):
+        try:
+            return _browser_cookie_login(callback_url, entry_url)
+        except Exception as e:
+            last_err = e
+            if i >= browser_retries:
+                raise
+            print(f"  浏览器登录失败，准备重试 {i}/{browser_retries}: {e}")
+            time.sleep(min(1.0 + i * 0.8, 4.0))
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("浏览器登录失败")
 
 
 def auto_login_with_session(
@@ -687,6 +785,8 @@ def auto_login_with_session(
     ocr = ddddocr.DdddOcr(show_ad=False)
     ssl_ctx = _build_ssl_context()
     target_host = (urllib.parse.urlsplit(entry_url).hostname or "").strip()
+    sso_timeout = _env_int("CURRICULUM_SSO_TIMEOUT", 30)
+    sso_net_retries = _env_int("CURRICULUM_SSO_NET_RETRIES", 3)
 
     cas_name = "/lyuapServer"
     encrypted_pwd = _rsa_encrypt_block(password)
@@ -700,7 +800,13 @@ def auto_login_with_session(
 
         kaptcha_url = f"{_SSO_ORIGIN}{cas_name}/kaptcha?uid=&sf_request_type=ajax"
         req = urllib.request.Request(kaptcha_url)
-        with opener.open(req, timeout=15) as resp:
+        with _open_with_retry(
+            req,
+            opener=opener,
+            timeout=sso_timeout,
+            retries=sso_net_retries,
+            label="kaptcha",
+        ) as resp:
             kdata = json.loads(resp.read().decode("utf-8-sig"))
 
         uid = kdata["uid"]
@@ -730,7 +836,13 @@ def auto_login_with_session(
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             },
         )
-        with opener.open(req, timeout=15) as resp:
+        with _open_with_retry(
+            req,
+            opener=opener,
+            timeout=sso_timeout,
+            retries=sso_net_retries,
+            label="sso_login",
+        ) as resp:
             login_body = resp.read().decode("utf-8-sig")
 
         login_resp = json.loads(login_body)
@@ -757,7 +869,13 @@ def auto_login_with_session(
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
         )
         try:
-            opener.open(req, timeout=20)
+            _open_with_retry(
+                req,
+                opener=opener,
+                timeout=sso_timeout,
+                retries=sso_net_retries,
+                label="cas_callback",
+            )
         except urllib.error.HTTPError:
             pass
 
@@ -769,7 +887,13 @@ def auto_login_with_session(
                     "Referer": _PORTAL_ORIGIN + "/",
                 },
             )
-            opener.open(req, timeout=20)
+            _open_with_retry(
+                req,
+                opener=opener,
+                timeout=sso_timeout,
+                retries=sso_net_retries,
+                label="entry_page",
+            )
         except urllib.error.HTTPError:
             pass
 
@@ -796,6 +920,8 @@ def auto_login(username: str, password: str, max_retries: int = 5) -> str:
 
     ocr = ddddocr.DdddOcr(show_ad=False)
     ssl_ctx = _build_ssl_context()
+    sso_timeout = _env_int("CURRICULUM_SSO_TIMEOUT", 30)
+    sso_net_retries = _env_int("CURRICULUM_SSO_NET_RETRIES", 3)
 
     cas_name = "/lyuapServer"
     encrypted_pwd = _rsa_encrypt_block(password)
@@ -804,7 +930,13 @@ def auto_login(username: str, password: str, max_retries: int = 5) -> str:
         # --- 1. 获取验证码 ---
         kaptcha_url = f"{_SSO_ORIGIN}{cas_name}/kaptcha?uid=&sf_request_type=ajax"
         req = urllib.request.Request(kaptcha_url)
-        with urllib.request.urlopen(req, timeout=15, context=ssl_ctx) as resp:
+        with _open_with_retry(
+            req,
+            context=ssl_ctx,
+            timeout=sso_timeout,
+            retries=sso_net_retries,
+            label="kaptcha",
+        ) as resp:
             kdata = json.loads(resp.read().decode("utf-8-sig"))
 
         uid = kdata["uid"]
@@ -831,7 +963,13 @@ def auto_login(username: str, password: str, max_retries: int = 5) -> str:
             "Content-Type": "application/x-www-form-urlencoded",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         })
-        with urllib.request.urlopen(req, timeout=15, context=ssl_ctx) as resp:
+        with _open_with_retry(
+            req,
+            context=ssl_ctx,
+            timeout=sso_timeout,
+            retries=sso_net_retries,
+            label="sso_login",
+        ) as resp:
             login_body = resp.read().decode("utf-8-sig")
 
         login_resp = json.loads(login_body)
@@ -866,7 +1004,13 @@ def auto_login(username: str, password: str, max_retries: int = 5) -> str:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         })
         try:
-            opener.open(req, timeout=15)
+            _open_with_retry(
+                req,
+                opener=opener,
+                timeout=sso_timeout,
+                retries=sso_net_retries,
+                label="cas_callback",
+            )
         except urllib.error.HTTPError:
             pass
 
@@ -893,11 +1037,10 @@ def build_config() -> Config:
     sso_user = env("SSO_USERNAME", "").strip()
     sso_pass = env("SSO_PASSWORD", "").strip()
     opener = None
+    cookie = ""
 
-    if cookie_raw:
-        cookie = normalize_cookie(cookie_raw)
-    elif sso_user and sso_pass:
-        print("CURRICULUM_COOKIE 未设置，使用 SSO_USERNAME/SSO_PASSWORD 自动登录...")
+    if sso_user and sso_pass:
+        print("使用 SSO_USERNAME/SSO_PASSWORD 自动登录...")
         try:
             cookie, browser_entry_url = auto_login_cookie_via_browser(sso_user, sso_pass, entry_url)
             if browser_entry_url:
@@ -911,10 +1054,20 @@ def build_config() -> Config:
                     parsed["userType"] = browser_parsed["userType"]
         except Exception as e:
             print(f"  浏览器登录失败，回退 HTTP 登录: {e}")
-            cookie, opener = auto_login_with_session(sso_user, sso_pass, entry_url)
+            try:
+                cookie, opener = auto_login_with_session(sso_user, sso_pass, entry_url)
+            except Exception:
+                if cookie_raw:
+                    print("  账号密码登录失败，回退使用 CURRICULUM_COOKIE")
+                    cookie = normalize_cookie(cookie_raw)
+                else:
+                    raise
+    elif cookie_raw:
+        print("未设置账号密码，使用 CURRICULUM_COOKIE")
+        cookie = normalize_cookie(cookie_raw)
     else:
         raise RuntimeError(
-            "缺少登录凭据：请设置 CURRICULUM_COOKIE，或同时设置 SSO_USERNAME 和 SSO_PASSWORD"
+            "缺少登录凭据：请设置 SSO_USERNAME/SSO_PASSWORD（推荐），或设置 CURRICULUM_COOKIE（备用）"
         )
 
     access_token = env("CURRICULUM_ACCESS_TOKEN", parsed.get("accessToken") or "", required=False).strip()
@@ -956,19 +1109,26 @@ def request_json(
 ) -> dict:
     body = None
     req_headers = dict(headers)
+    api_timeout = _env_int("CURRICULUM_API_TIMEOUT", 40)
+    api_retries = _env_int("CURRICULUM_API_RETRIES", 3)
     if data is not None:
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         req_headers["Content-Type"] = "application/json;charset=UTF-8"
 
     req = urllib.request.Request(origin + path, data=body, headers=req_headers, method=method)
     try:
-        if opener is not None:
-            resp_obj = opener.open(req, timeout=30)
-        else:
-            resp_obj = urllib.request.urlopen(req, timeout=30)
+        resp_obj = _open_with_retry(
+            req,
+            opener=opener,
+            timeout=api_timeout,
+            retries=api_retries,
+            label=path,
+        )
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", "replace")
         raise ApiError(f"HTTP {e.code} path={path} body={err_body[:200]}") from e
+    except Exception as e:
+        raise ApiError(f"HTTP request failed path={path} error={e}") from e
 
     with resp_obj as resp:
         raw = resp.read().decode("utf-8-sig", "replace").lstrip("\ufeff")
