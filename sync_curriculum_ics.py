@@ -339,7 +339,7 @@ def _build_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
-def auto_login(username: str, password: str, max_retries: int = 5) -> str:
+def auto_login(username: str, password: str, entry_url: str = "", max_retries: int = 5) -> str:
     try:
         import ddddocr  # type: ignore
     except ImportError:
@@ -419,16 +419,29 @@ def auto_login(username: str, password: str, max_retries: int = 5) -> str:
             urllib.request.HTTPCookieProcessor(cj),
             urllib.request.HTTPSHandler(context=ssl_ctx),
         )
+        _UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
         callback_url = f"{_CAS_SERVICE}&ticket={urllib.parse.quote(ticket, safe='')}"
-        req = urllib.request.Request(callback_url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        })
+        req = urllib.request.Request(callback_url, headers=_UA)
         try:
             opener.open(req, timeout=30)
         except urllib.error.HTTPError:
             pass
 
+        portal_cookies = [f"{c.name}={c.value}" for c in cj]
+        print(f"  门户 Cookie ({len(portal_cookies)} 项)")
+
+        # --- 5. 访问课表入口 URL，跟着 aTrust 重定向走完，拿到课表域名的 Cookie ---
+        if entry_url:
+            target_netloc = urllib.parse.urlsplit(entry_url).netloc
+            print(f"  正在建立 {target_netloc} 的会话...")
+            req = urllib.request.Request(entry_url, headers=_UA)
+            try:
+                opener.open(req, timeout=30)
+            except urllib.error.HTTPError:
+                pass  # 重定向链末尾可能返回非 200，没关系
+
+        # 收集所有域名的 cookie
         cookie_parts = []
         for c in cj:
             cookie_parts.append(f"{c.name}={c.value}")
@@ -437,7 +450,7 @@ def auto_login(username: str, password: str, max_retries: int = 5) -> str:
             raise RuntimeError("CAS 回调后未获取到任何 Cookie")
 
         cookie_str = "; ".join(cookie_parts)
-        print(f"  获取到 Cookie ({len(cookie_parts)} 项)")
+        print(f"  最终 Cookie ({len(cookie_parts)} 项)")
         return cookie_str
 
     raise RuntimeError(f"验证码识别连续 {max_retries} 次失败，请检查 ddddocr 或手动登录")
@@ -466,7 +479,7 @@ def build_config() -> Config:
         cookie = normalize_cookie(cookie_raw)
     elif sso_user and sso_pass:
         print("CURRICULUM_COOKIE 未设置，使用 SSO_USERNAME/SSO_PASSWORD 自动登录...")
-        cookie = auto_login(sso_user, sso_pass)
+        cookie = auto_login(sso_user, sso_pass, entry_url=entry_url)
     else:
         raise RuntimeError(
             "缺少登录凭据：请设置 CURRICULUM_COOKIE，或同时设置 SSO_USERNAME 和 SSO_PASSWORD"
