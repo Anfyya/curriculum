@@ -431,20 +431,29 @@ def auto_login(username: str, password: str, entry_url: str = "", max_retries: i
         portal_cookies = [f"{c.name}={c.value}" for c in cj]
         print(f"  门户 Cookie ({len(portal_cookies)} 项)")
 
-        # --- 5. 访问课表入口 URL，跟着 aTrust 重定向走完，拿到课表域名的 Cookie ---
+        # --- 5. 访问课表入口 URL，跟着 aTrust 重定向拿到目标域名的 sdp_app_session ---
         if entry_url:
-            target_netloc = urllib.parse.urlsplit(entry_url).netloc
-            print(f"  正在建立 {target_netloc} 的会话...")
+            target_host = urllib.parse.urlsplit(entry_url).hostname  # e.g. zichan.jxec.edu.cn
+            print(f"  正在建立 {target_host} 的会话 (跟随 aTrust 重定向)...")
             req = urllib.request.Request(entry_url, headers=_UA)
             try:
                 opener.open(req, timeout=30)
             except urllib.error.HTTPError:
                 pass  # 重定向链末尾可能返回非 200，没关系
 
-        # 收集所有域名的 cookie
-        cookie_parts = []
-        for c in cj:
-            cookie_parts.append(f"{c.name}={c.value}")
+            # 只收集目标域名的 cookie
+            target_cookies = [c for c in cj if target_host and target_host in c.domain]
+            app_session = [c for c in target_cookies if "sdp_app_session" in c.name]
+            if app_session:
+                print(f"  aTrust 会话建立成功: {[c.name for c in app_session]}")
+            else:
+                print(f"  警告: 未获取到 sdp_app_session cookie (目标域名 {target_host} 共 {len(target_cookies)} 个 cookie)")
+                for c in cj:
+                    print(f"    [{c.domain}] {c.name}")
+
+            cookie_parts = [f"{c.name}={c.value}" for c in target_cookies]
+        else:
+            cookie_parts = [f"{c.name}={c.value}" for c in cj]
 
         if not cookie_parts:
             raise RuntimeError("CAS 回调后未获取到任何 Cookie")
