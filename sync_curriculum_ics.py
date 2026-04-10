@@ -618,7 +618,7 @@ def request_json(origin: str, headers: Dict[str, str], method: str, path: str, d
         req_headers["Content-Type"] = "application/json;charset=UTF-8"
 
     req = urllib.request.Request(origin + path, data=body, headers=req_headers, method=method)
-    with urllib.request.urlopen(req, timeout=45) as resp:
+    with urllib.request.urlopen(req, timeout=45, context=_build_ssl_context()) as resp:
         raw = resp.read().decode("utf-8-sig", "replace").lstrip("\ufeff")
         ct = (resp.headers.get("Content-Type") or "").lower()
         final_url = resp.geturl()
