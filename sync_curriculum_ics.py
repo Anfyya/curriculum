@@ -686,13 +686,22 @@ def build_ics(config: Config) -> Tuple[str, int]:
         week_codes = [current_week]
     max_week = max(week_codes)
 
-    payload = {
-        "academicYearSemester": semester,
-        "userId": config.user_id,
-        "userType": config.user_type,
-        "weeks": week_codes,
-    }
-    schedule = request_json(origin, headers, "POST", "/api/arrange/mobile/courseSchedule/courseSchedule", payload).get("data", {})
+    rows: List[dict] = []
+    # 避免一次请求整学期导致后端把不同周次课程错误合并，改为逐周拉取后汇总
+    for week_code in week_codes:
+        payload = {
+            "academicYearSemester": semester,
+            "userId": config.user_id,
+            "userType": config.user_type,
+            "weeks": [week_code],
+        }
+        schedule = request_json(origin, headers, "POST", "/api/arrange/mobile/courseSchedule/courseSchedule", payload).get("data", {})
+        for r in schedule.get("course", []):
+            if not str(r.get("courseName") or "").strip():
+                continue
+            rr = dict(r)
+            rr["_week_code"] = week_code
+            rows.append(rr)
 
     today_iso = None
     try:
@@ -713,8 +722,6 @@ def build_ics(config: Config) -> Tuple[str, int]:
 
     current_week_monday = today_date - timedelta(days=today_date.weekday())
 
-    rows = [r for r in schedule.get("course", []) if str(r.get("courseName") or "").strip()]
-
     grouped: Dict[Tuple[str, str, str, int, str, str], set] = {}
     for r in rows:
         offset = day_offset(r)
@@ -725,7 +732,8 @@ def build_ics(config: Config) -> Tuple[str, int]:
         teacher = normalize_teacher(str(r.get("teacherName") or "").strip())
         classroom = re.sub(r"\s+", " ", str(r.get("classroomName") or "").strip())
         class_name = str(r.get("teachingClassName") or r.get("className") or "").strip()
-        weeks_expr = str(r.get("weeks") or "").strip()
+        # 单周查询时，优先用请求周号，避免使用接口返回的聚合周次字符串
+        weeks_expr = str(r.get("_week_code") or r.get("weeks") or "").strip()
 
         periods = parse_periods(r.get("time"))
         if not periods:
