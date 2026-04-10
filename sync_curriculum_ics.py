@@ -68,6 +68,29 @@ class ApiError(RuntimeError):
     pass
 
 
+def normalize_cookie(raw_cookie: str) -> str:
+    s = (raw_cookie or "").lstrip("\ufeff").strip()
+    if not s:
+        return ""
+    # 兼容把整行 "Cookie: xxx" 直接粘贴到 Secret 的情况
+    if s.lower().startswith("cookie:"):
+        s = s.split(":", 1)[1].strip()
+    # 兼容多行粘贴
+    s = s.replace("\r", ";").replace("\n", ";")
+    parts = []
+    for p in s.split(";"):
+        p = p.strip()
+        if not p or "=" not in p:
+            continue
+        k, v = p.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if not k:
+            continue
+        parts.append(f"{k}={v}")
+    return "; ".join(parts)
+
+
 def env(name: str, default: Optional[str] = None, required: bool = False) -> str:
     val = os.getenv(name, default)
     if required and (val is None or str(val).strip() == ""):
@@ -268,7 +291,9 @@ def build_config() -> Config:
 
     user_type = env("CURRICULUM_USER_TYPE", parsed.get("userType") or "0", required=False).strip() or "0"
 
-    cookie = env("CURRICULUM_COOKIE", required=True)
+    cookie = normalize_cookie(env("CURRICULUM_COOKIE", required=True))
+    if not cookie:
+        raise RuntimeError("CURRICULUM_COOKIE 为空或格式无效")
     output_path = env("CURRICULUM_OUTPUT", "curriculum.ics")
     calendar_name = env("CURRICULUM_CALENDAR_NAME", "课程表")
 
@@ -296,9 +321,13 @@ def request_json(origin: str, headers: Dict[str, str], method: str, path: str, d
         # 兼容接口返回体带 UTF-8 BOM
         raw = resp.read().decode("utf-8-sig", "replace").lstrip("\ufeff")
         ct = (resp.headers.get("Content-Type") or "").lower()
+        final_url = resp.geturl()
 
     if "json" not in ct and not raw.strip().startswith("{"):
-        raise ApiError(f"接口返回非 JSON，可能登录态失效: {path}")
+        preview = re.sub(r"\s+", " ", raw[:120]).strip()
+        raise ApiError(
+            f"接口返回非 JSON，可能登录态失效: {path} final_url={final_url} content_type={ct or '-'} preview={preview}"
+        )
 
     try:
         obj = json.loads(raw)
