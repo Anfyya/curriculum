@@ -618,7 +618,17 @@ def request_json(origin: str, headers: Dict[str, str], method: str, path: str, d
         req_headers["Content-Type"] = "application/json;charset=UTF-8"
 
     req = urllib.request.Request(origin + path, data=body, headers=req_headers, method=method)
-    with urllib.request.urlopen(req, timeout=45, context=_build_ssl_context()) as resp:
+    try:
+        resp = urllib.request.urlopen(req, timeout=45, context=_build_ssl_context())
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")[:500] if e.fp else ""
+        err_url = e.url or (origin + path)
+        print(f"  API请求失败: {e.code} {path}")
+        print(f"    URL: {err_url[:200]}")
+        print(f"    响应头: { {k: v for k, v in (e.headers.items() if e.headers else [])} }")
+        print(f"    响应体: {err_body[:300]}")
+        raise
+    with resp:
         raw = resp.read().decode("utf-8-sig", "replace").lstrip("\ufeff")
         ct = (resp.headers.get("Content-Type") or "").lower()
         final_url = resp.geturl()
