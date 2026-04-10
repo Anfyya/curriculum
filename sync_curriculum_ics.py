@@ -415,21 +415,35 @@ def auto_login(username: str, password: str, entry_url: str = "", max_retries: i
 
         # --- 4. 用 ticket 换取门户 Cookie ---
         cj = http.cookiejar.CookieJar()
+
+        class _DebugRedirectHandler(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                print(f"    [REDIR] {code} {req.full_url[:120]}")
+                print(f"         -> {newurl[:150]}")
+                for hk, hv in headers.items():
+                    hl = hk.lower()
+                    if "cookie" in hl or "location" in hl:
+                        print(f"         {hk}: {hv[:200]}")
+                return super().redirect_request(req, fp, code, msg, headers, newurl)
+
         opener = urllib.request.build_opener(
+            _DebugRedirectHandler,
             urllib.request.HTTPCookieProcessor(cj),
             urllib.request.HTTPSHandler(context=ssl_ctx),
         )
         _UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
         callback_url = f"{_CAS_SERVICE}&ticket={urllib.parse.quote(ticket, safe='')}"
+        print(f"  CAS 回调: {callback_url[:120]}")
         req = urllib.request.Request(callback_url, headers=_UA)
         try:
-            opener.open(req, timeout=30)
-        except urllib.error.HTTPError:
-            pass
+            resp = opener.open(req, timeout=30)
+            print(f"  CAS 回调结束: status={resp.status} url={resp.geturl()[:120]}")
+        except urllib.error.HTTPError as e:
+            print(f"  CAS 回调 HTTPError: {e.code}")
 
-        portal_cookies = [f"{c.name}={c.value}" for c in cj]
-        print(f"  门户 Cookie ({len(portal_cookies)} 项)")
+        portal_cookies = {c.name: c for c in cj}
+        print(f"  门户 Cookie ({len(portal_cookies)} 项): {list(portal_cookies.keys())}")
 
         # --- 5. 访问课表入口 URL，跟着 aTrust 重定向拿到目标域名的 sdp_app_session ---
         if entry_url:
@@ -441,21 +455,8 @@ def auto_login(username: str, password: str, entry_url: str = "", max_retries: i
                 final_url = resp.geturl()
                 body_preview = resp.read(2000).decode("utf-8", errors="replace")
                 print(f"  重定向结束: status={resp.status} final_url={final_url[:150]}")
-                # 如果网关返回了 JS 跳转而非 HTTP 302，尝试提取跳转 URL 并再跟一次
-                if "sdp_app_session" not in " ".join(c.name for c in cj):
-                    js_match = re.search(r'(?:window\.location\.href|location\.href|window\.location)\s*=\s*["\']([^"\']+)', body_preview)
-                    meta_match = re.search(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\'][^"\']*url=([^"\']+)', body_preview, re.I)
-                    redir_url = (js_match and js_match.group(1)) or (meta_match and meta_match.group(1))
-                    if redir_url:
-                        print(f"  检测到 JS/Meta 跳转: {redir_url[:150]}")
-                        req2 = urllib.request.Request(redir_url, headers=_UA)
-                        try:
-                            opener.open(req2, timeout=30)
-                        except (urllib.error.HTTPError, urllib.error.URLError):
-                            pass
             except urllib.error.HTTPError as e:
                 print(f"  重定向链 HTTPError: {e.code} {e.url[:150] if e.url else ''}")
-                # 读取错误响应里的 Set-Cookie 仍会被 CookieJar 捕获
             except urllib.error.URLError as e:
                 print(f"  重定向链 URLError: {e.reason}")
             except Exception as e:
