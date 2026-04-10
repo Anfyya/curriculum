@@ -437,9 +437,29 @@ def auto_login(username: str, password: str, entry_url: str = "", max_retries: i
             print(f"  正在建立 {target_host} 的会话 (跟随 aTrust 重定向)...")
             req = urllib.request.Request(entry_url, headers=_UA)
             try:
-                opener.open(req, timeout=30)
-            except urllib.error.HTTPError:
-                pass  # 重定向链末尾可能返回非 200，没关系
+                resp = opener.open(req, timeout=30)
+                final_url = resp.geturl()
+                body_preview = resp.read(2000).decode("utf-8", errors="replace")
+                print(f"  重定向结束: status={resp.status} final_url={final_url[:150]}")
+                # 如果网关返回了 JS 跳转而非 HTTP 302，尝试提取跳转 URL 并再跟一次
+                if "sdp_app_session" not in " ".join(c.name for c in cj):
+                    js_match = re.search(r'(?:window\.location\.href|location\.href|window\.location)\s*=\s*["\']([^"\']+)', body_preview)
+                    meta_match = re.search(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\'][^"\']*url=([^"\']+)', body_preview, re.I)
+                    redir_url = (js_match and js_match.group(1)) or (meta_match and meta_match.group(1))
+                    if redir_url:
+                        print(f"  检测到 JS/Meta 跳转: {redir_url[:150]}")
+                        req2 = urllib.request.Request(redir_url, headers=_UA)
+                        try:
+                            opener.open(req2, timeout=30)
+                        except (urllib.error.HTTPError, urllib.error.URLError):
+                            pass
+            except urllib.error.HTTPError as e:
+                print(f"  重定向链 HTTPError: {e.code} {e.url[:150] if e.url else ''}")
+                # 读取错误响应里的 Set-Cookie 仍会被 CookieJar 捕获
+            except urllib.error.URLError as e:
+                print(f"  重定向链 URLError: {e.reason}")
+            except Exception as e:
+                print(f"  重定向链异常: {type(e).__name__}: {e}")
 
             # 只收集目标域名的 cookie
             target_cookies = [c for c in cj if target_host and target_host in c.domain]
@@ -456,7 +476,7 @@ def auto_login(username: str, password: str, entry_url: str = "", max_retries: i
             cookie_parts = [f"{c.name}={c.value}" for c in cj]
 
         if not cookie_parts:
-            raise RuntimeError("CAS 回调后未获取到任何 Cookie")
+            raise RuntimeError("未获取到目标域名的 Cookie，aTrust 重定向可能失败")
 
         cookie_str = "; ".join(cookie_parts)
         print(f"  最终 Cookie ({len(cookie_parts)} 项)")
