@@ -569,6 +569,9 @@ def build_config() -> Config:
     parsed = parse_entry(entry_url_raw)
 
     access_token = env("CURRICULUM_ACCESS_TOKEN", parsed.get("accessToken") or "", required=False).strip()
+    # 容错：如果用户把 "accessToken=xxx" 整个粘贴为值，去掉前缀
+    if access_token.startswith("accessToken="):
+        access_token = access_token[len("accessToken="):]
     if not access_token:
         raise RuntimeError("缺少 accessToken：请设置 CURRICULUM_ACCESS_TOKEN，或在 CURRICULUM_ENTRY_URL 中带上 accessToken 参数")
 
@@ -689,9 +692,6 @@ def build_ics(config: Config) -> Tuple[str, int]:
         "userType": config.user_type,
         "weeks": week_codes,
     }
-    print(f"  accessToken(len={len(config.access_token)}): {config.access_token[:20]}...{config.access_token[-20:]}")
-    print(f"  cookie(len={len(config.cookie)}): {config.cookie[:40]}...")
-    print(f"  payload: {json.dumps(payload)[:200]}")
     schedule = request_json(origin, headers, "POST", "/api/arrange/mobile/courseSchedule/courseSchedule", payload).get("data", {})
 
     today_iso = None
