@@ -1,9 +1,12 @@
 ﻿#!/usr/bin/env python3
+import base64
 import hashlib
 import html
+import http.cookiejar
 import json
 import os
 import re
+import ssl
 import sys
 import urllib.parse
 import urllib.request
@@ -277,6 +280,178 @@ def load_period_map() -> Dict[int, Tuple[str, str]]:
     return dict(DEFAULT_PERIOD_TIMES)
 
 
+# ---------------------------------------------------------------------------
+#  SSO 自动登录（联奕 CAS）
+# ---------------------------------------------------------------------------
+
+# RSA 公钥（硬编码在 SSO 前端 JS 中）
+_RSA_EXPONENT = 0x010001
+_RSA_MODULUS = int(
+    "00b5eeb166e069920e80bebd1fea4829d3d1f3216f2aabe79b6c47a3c18dcee5"
+    "fd22c2e7ac519cab59198ece036dcf289ea8201e2a0b9ded307f8fb704136eae"
+    "b670286f5ad44e691005ba9ea5af04ada5367cd724b5a26fdb5120cc95b64316"
+    "04bd219c6b7d83a6f8f24b43918ea988a76f93c333aa5a20991493d4eb1117e7b1",
+    16,
+)
+_RSA_CHUNK_SIZE = 2 * ((_RSA_MODULUS.bit_length() + 15) // 16)  # 与 JS 一致
+
+_SSO_ORIGIN = "https://sso.jxec.edu.cn:10445"
+_PORTAL_ORIGIN = "https://0xr.jxec.edu.cn:10443"
+_CAS_SERVICE = _PORTAL_ORIGIN + "/passport/v1/auth/cas?sfDomain=1"
+
+
+def _rsa_encrypt_block(plaintext: str) -> str:
+    """复现联奕 CAS 前端 JS 的 encryptedString() —— Barrett RSA，无 PKCS 填充。"""
+    codes = [ord(ch) for ch in plaintext]
+    while len(codes) % _RSA_CHUNK_SIZE != 0:
+        codes.append(0)
+
+    # JS: digits[r] = a[l] | (a[l+1] << 8)，即小端序每两字节一组
+    digits: List[int] = []
+    for i in range(0, len(codes), 2):
+        digits.append(codes[i] | (codes[i + 1] << 8))
+
+    # 转为 Python 大整数
+    m = 0
+    for i in range(len(digits) - 1, -1, -1):
+        m = (m << 16) | digits[i]
+
+    c = pow(m, _RSA_EXPONENT, _RSA_MODULUS)
+
+    # JS biToHex：输出固定长度十六进制（与 modulus 等长）
+    hex_len = (_RSA_MODULUS.bit_length() + 3) // 4
+    return format(c, f"0{hex_len}x")
+
+
+def _solve_captcha_expr(text: str) -> str:
+    """解析 ddddocr 识别出的算式（如 '3+5='）并返回计算结果字符串。"""
+    text = text.strip().rstrip("=").strip()
+    text = text.replace("×", "*").replace("x", "*").replace("X", "*").replace("÷", "/")
+    try:
+        result = eval(text, {"__builtins__": {}})  # noqa: S307 — 仅处理简单算术
+        return str(int(result))
+    except Exception:
+        return text
+
+
+def _build_ssl_context() -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def auto_login(username: str, password: str, max_retries: int = 5) -> str:
+    """
+    自动完成 SSO 登录，返回可用于课表 API 的 Cookie 字符串。
+
+    流程：
+      1. 请求验证码图片 → ddddocr 识别算式 → 计算结果
+      2. RSA 加密密码
+      3. POST 登录接口拿到 CAS ticket
+      4. 拿 ticket 换取门户 Cookie（Set-Cookie）
+    """
+    try:
+        import ddddocr  # type: ignore
+    except ImportError:
+        raise RuntimeError("auto_login 需要 ddddocr，请先 pip install ddddocr")
+
+    ocr = ddddocr.DdddOcr(show_ad=False)
+    ssl_ctx = _build_ssl_context()
+
+    cas_name = "/lyuapServer"
+    encrypted_pwd = _rsa_encrypt_block(password)
+
+    for attempt in range(1, max_retries + 1):
+        # --- 1. 获取验证码 ---
+        kaptcha_url = f"{_SSO_ORIGIN}{cas_name}/kaptcha?uid=&sf_request_type=ajax"
+        req = urllib.request.Request(kaptcha_url)
+        with urllib.request.urlopen(req, timeout=15, context=ssl_ctx) as resp:
+            kdata = json.loads(resp.read().decode("utf-8-sig"))
+
+        uid = kdata["uid"]
+        img_b64 = kdata["content"].split(",", 1)[1]  # 去掉 data:image/png;base64, 前缀
+        img_bytes = base64.b64decode(img_b64)
+
+        # --- 2. OCR 识别验证码 ---
+        raw_text = ocr.classification(img_bytes)
+        code = _solve_captcha_expr(raw_text)
+        print(f"  auto_login 尝试 {attempt}/{max_retries}：OCR={raw_text!r} → code={code}")
+
+        # --- 3. POST 登录 ---
+        login_url = f"{_SSO_ORIGIN}{cas_name}/v1/tickets?sf_request_type=ajax"
+        form = urllib.parse.urlencode({
+            "username": username,
+            "password": encrypted_pwd,
+            "service": _CAS_SERVICE,
+            "loginType": "",
+            "id": uid,
+            "code": code,
+            "otpcode": "",
+        }).encode("utf-8")
+        req = urllib.request.Request(login_url, data=form, method="POST", headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        })
+        with urllib.request.urlopen(req, timeout=15, context=ssl_ctx) as resp:
+            login_body = resp.read().decode("utf-8-sig")
+
+        login_resp = json.loads(login_body)
+        data = login_resp.get("data", {})
+
+        # 检查是否返回了错误码
+        if isinstance(data, dict) and data.get("code"):
+            err_code = data["code"]
+            if err_code == "CODEFALSE":
+                print(f"  验证码错误，重试...")
+                continue
+            elif err_code == "BINDPHONE":
+                raise RuntimeError("SSO 要求绑定手机，无法自动登录")
+            else:
+                raise RuntimeError(f"SSO 登录返回错误码: {err_code}")
+
+        # 登录成功 —— data 是 ticket 字符串或包含 ticket
+        # 成功时 data 可能直接是 ticket 字符串
+        if isinstance(data, str):
+            ticket = data
+        else:
+            raise RuntimeError(f"SSO 登录返回未知格式: {login_body[:300]}")
+
+        print(f"  SSO 登录成功，获取到 ticket")
+
+        # --- 4. 用 ticket 换取门户 Cookie ---
+        # CAS 回调：GET /passport/v1/auth/cas?sfDomain=1&ticket=<ticket>
+        # 门户会 Set-Cookie，我们需要收集所有 cookie
+        cj = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(cj),
+            urllib.request.HTTPSHandler(context=ssl_ctx),
+        )
+
+        callback_url = f"{_CAS_SERVICE}&ticket={urllib.parse.quote(ticket, safe='')}"
+        req = urllib.request.Request(callback_url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        })
+        try:
+            opener.open(req, timeout=15)
+        except urllib.error.HTTPError:
+            pass  # 可能 302 到门户首页，没关系
+
+        # 收集所有 cookie
+        cookie_parts = []
+        for c in cj:
+            cookie_parts.append(f"{c.name}={c.value}")
+
+        if not cookie_parts:
+            raise RuntimeError("CAS 回调后未获取到任何 Cookie")
+
+        cookie_str = "; ".join(cookie_parts)
+        print(f"  获取到 Cookie ({len(cookie_parts)} 项)")
+        return cookie_str
+
+    raise RuntimeError(f"验证码识别连续 {max_retries} 次失败，请检查 ddddocr 或手动登录")
+
+
 def build_config() -> Config:
     entry_url = env("CURRICULUM_ENTRY_URL", required=True)
     parsed = parse_entry(entry_url)
@@ -291,9 +466,22 @@ def build_config() -> Config:
 
     user_type = env("CURRICULUM_USER_TYPE", parsed.get("userType") or "0", required=False).strip() or "0"
 
-    cookie = normalize_cookie(env("CURRICULUM_COOKIE", required=True))
+    cookie_raw = env("CURRICULUM_COOKIE", "").strip()
+    sso_user = env("SSO_USERNAME", "").strip()
+    sso_pass = env("SSO_PASSWORD", "").strip()
+
+    if cookie_raw:
+        cookie = normalize_cookie(cookie_raw)
+    elif sso_user and sso_pass:
+        print("CURRICULUM_COOKIE 未设置，使用 SSO_USERNAME/SSO_PASSWORD 自动登录...")
+        cookie = auto_login(sso_user, sso_pass)
+    else:
+        raise RuntimeError(
+            "缺少登录凭据：请设置 CURRICULUM_COOKIE，或同时设置 SSO_USERNAME 和 SSO_PASSWORD"
+        )
+
     if not cookie:
-        raise RuntimeError("CURRICULUM_COOKIE 为空或格式无效")
+        raise RuntimeError("Cookie 为空或格式无效")
     output_path = env("CURRICULUM_OUTPUT", "curriculum.ics")
     calendar_name = env("CURRICULUM_CALENDAR_NAME", "课程表")
 
