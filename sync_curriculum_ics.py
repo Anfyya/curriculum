@@ -87,11 +87,39 @@ def parse_entry(entry_url: str) -> Dict[str, str]:
                 return vals[0]
         return ""
 
-    return {
+    result = {
         "accessToken": first("accessToken", "amp;accessToken"),
         "id": first("id", "amp;id"),
         "userType": first("userType", "amp;userType"),
     }
+
+    # 兼容网关中转链接：...shortcut.html?appUrl=<encode(url)>
+    app_url = first("appUrl", "amp;appUrl")
+    if app_url and (not result["accessToken"] or not result["id"]):
+        decoded_app = html.unescape(urllib.parse.unquote(app_url))
+        aq = urllib.parse.parse_qs(urllib.parse.urlsplit(decoded_app).query)
+        if not result["accessToken"]:
+            result["accessToken"] = (aq.get("accessToken") or [""])[0]
+        if not result["id"]:
+            result["id"] = (aq.get("id") or [""])[0]
+        if not result["userType"]:
+            result["userType"] = (aq.get("userType") or [""])[0]
+
+    # 最后兜底：从整串文本里做正则提取
+    if not result["accessToken"]:
+        m = re.search(r"(?:^|[?&])accessToken=([^&\\s]+)", normalized)
+        if m:
+            result["accessToken"] = urllib.parse.unquote(m.group(1))
+    if not result["id"]:
+        m = re.search(r"(?:^|[?&])id=([^&\\s]+)", normalized)
+        if m:
+            result["id"] = urllib.parse.unquote(m.group(1))
+    if not result["userType"]:
+        m = re.search(r"(?:^|[?&])userType=([^&\\s]+)", normalized)
+        if m:
+            result["userType"] = urllib.parse.unquote(m.group(1))
+
+    return result
 
 
 def normalize_teacher(name: str) -> str:
