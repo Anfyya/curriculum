@@ -689,6 +689,9 @@ def build_ics(config: Config) -> Tuple[str, int]:
         "userType": config.user_type,
         "weeks": week_codes,
     }
+    print(f"  accessToken(len={len(config.access_token)}): {config.access_token[:20]}...{config.access_token[-20:]}")
+    print(f"  cookie(len={len(config.cookie)}): {config.cookie[:40]}...")
+    print(f"  payload: {json.dumps(payload)[:200]}")
     schedule = request_json(origin, headers, "POST", "/api/arrange/mobile/courseSchedule/courseSchedule", payload).get("data", {})
 
     today_iso = None
