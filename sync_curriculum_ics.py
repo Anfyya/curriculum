@@ -354,9 +354,17 @@ def auto_login(username: str, password: str, max_retries: int = 5) -> str:
     for attempt in range(1, max_retries + 1):
         # --- 1. 获取验证码 ---
         kaptcha_url = f"{_SSO_ORIGIN}{cas_name}/kaptcha?uid=&sf_request_type=ajax"
-        req = urllib.request.Request(kaptcha_url)
-        with urllib.request.urlopen(req, timeout=15, context=ssl_ctx) as resp:
-            kdata = json.loads(resp.read().decode("utf-8-sig"))
+        req = urllib.request.Request(kaptcha_url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=30, context=ssl_ctx) as resp:
+                kdata = json.loads(resp.read().decode("utf-8-sig"))
+        except Exception as e:
+            print(f"  auto_login 尝试 {attempt}/{max_retries}：获取验证码失败: {e}")
+            if attempt < max_retries:
+                continue
+            raise
 
         uid = kdata["uid"]
         img_b64 = kdata["content"].split(",", 1)[1]
@@ -382,7 +390,7 @@ def auto_login(username: str, password: str, max_retries: int = 5) -> str:
             "Content-Type": "application/x-www-form-urlencoded",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         })
-        with urllib.request.urlopen(req, timeout=15, context=ssl_ctx) as resp:
+        with urllib.request.urlopen(req, timeout=30, context=ssl_ctx) as resp:
             login_body = resp.read().decode("utf-8-sig")
 
         login_resp = json.loads(login_body)
@@ -417,7 +425,7 @@ def auto_login(username: str, password: str, max_retries: int = 5) -> str:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         })
         try:
-            opener.open(req, timeout=15)
+            opener.open(req, timeout=30)
         except urllib.error.HTTPError:
             pass
 
@@ -490,7 +498,7 @@ def request_json(origin: str, headers: Dict[str, str], method: str, path: str, d
         req_headers["Content-Type"] = "application/json;charset=UTF-8"
 
     req = urllib.request.Request(origin + path, data=body, headers=req_headers, method=method)
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=45) as resp:
         raw = resp.read().decode("utf-8-sig", "replace").lstrip("\ufeff")
         ct = (resp.headers.get("Content-Type") or "").lower()
         final_url = resp.geturl()
@@ -674,8 +682,13 @@ def build_ics(config: Config) -> Tuple[str, int]:
 
 
 def main() -> int:
+    # 确保 print 实时输出（GitHub Actions 默认全缓冲）
+    sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, "reconfigure") else None
+    sys.stderr.reconfigure(line_buffering=True) if hasattr(sys.stderr, "reconfigure") else None
+
     try:
         cfg = build_config()
+        print(f"配置加载完成，origin={urllib.parse.urlsplit(cfg.entry_url).netloc}")
         ics_text, count = build_ics(cfg)
         with open(cfg.output_path, "w", encoding="utf-8", newline="") as f:
             f.write(ics_text)
