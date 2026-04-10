@@ -478,7 +478,7 @@ const chromePath = process.argv[5];
 const debugPort = Number(process.argv[6] || '0');
 
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
-async function waitForJsonVersion(port, timeoutMs=25000){
+async function waitForJsonVersion(port, getErr, timeoutMs=25000){
   const end = Date.now() + timeoutMs;
   while (Date.now() < end){
     try {
@@ -487,7 +487,8 @@ async function waitForJsonVersion(port, timeoutMs=25000){
     } catch {}
     await sleep(200);
   }
-  throw new Error('waitForJsonVersion timeout');
+  const tail = (getErr ? String(getErr() || '') : '').slice(-1500);
+  throw new Error('waitForJsonVersion timeout' + (tail ? `; chromeErr=${tail}` : ''));
 }
 
 async function main(){
@@ -498,15 +499,30 @@ async function main(){
     `--remote-debugging-port=${debugPort}`,
     '--headless=new',
     '--disable-gpu',
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
     '--no-first-run',
     '--no-default-browser-check',
     '--window-size=1366,900',
     `--user-data-dir=${profileDir}`,
     'about:blank'
-  ], { stdio: 'ignore' });
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+  let chromeErr = '';
+  cp.stderr.on('data', (chunk) => {
+    chromeErr += String(chunk || '');
+    if (chromeErr.length > 12000) chromeErr = chromeErr.slice(-12000);
+  });
+  cp.on('error', (e) => {
+    chromeErr += `\n[spawn_error] ${e && e.message ? e.message : String(e)}`;
+  });
 
   try {
-    const info = await waitForJsonVersion(debugPort);
+    const info = await waitForJsonVersion(debugPort, () => chromeErr);
+    if (typeof WebSocket === 'undefined') {
+      throw new Error('global WebSocket is undefined in current Node runtime');
+    }
     const ws = new WebSocket(info.webSocketDebuggerUrl);
     const pending = new Map();
     let id = 0;
@@ -560,6 +576,9 @@ async function main(){
     fs.writeFileSync(outPath, JSON.stringify({ href1, href2, cookies: (c && c.cookies) ? c.cookies : [] }), 'utf8');
     ws.close();
   } finally {
+    if (cp.exitCode !== null && cp.exitCode !== 0 && chromeErr) {
+      console.error('[chrome_stderr]', chromeErr);
+    }
     try { cp.kill(); } catch {}
     await sleep(300);
     try { fs.rmSync(profileDir, { recursive: true, force: true }); } catch {}
@@ -579,6 +598,7 @@ main().catch((e) => {
         out_path = f_out.name
 
     debug_port = str(int(os.getenv("CURRICULUM_CHROME_DEBUG_PORT", "9262")))
+    result: dict
     try:
         subprocess.run(
             [node_bin, js_path, callback_url, entry_url, out_path, chrome_bin, debug_port],
@@ -588,8 +608,23 @@ main().catch((e) => {
             text=True,
             timeout=120,
         )
+    except subprocess.CalledProcessError as e:
+        stderr_tail = (e.stderr or "").strip()[-1600:]
+        stdout_tail = (e.stdout or "").strip()[-600:]
+        details = f"exit_code={e.returncode}"
+        if stderr_tail:
+            details += f", stderr={stderr_tail}"
+        if stdout_tail:
+            details += f", stdout={stdout_tail}"
+        raise RuntimeError(f"浏览器登录子进程失败: {details}") from e
+    except subprocess.TimeoutExpired as e:
+        stderr_tail = (e.stderr or "").strip()[-1600:] if isinstance(e.stderr, str) else ""
+        raise RuntimeError(f"浏览器登录子进程超时(120s){', stderr=' + stderr_tail if stderr_tail else ''}") from e
+    try:
         with open(out_path, "r", encoding="utf-8") as f:
             result = json.load(f)
+    except Exception as e:
+        raise RuntimeError(f"浏览器登录结果读取失败: {e}") from e
     finally:
         try:
             os.remove(js_path)

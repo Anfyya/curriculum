@@ -26,14 +26,18 @@ jobs:
       - name: Install dependencies
         run: pip install ddddocr
 
+      - name: Check browser runtime
+        run: |
+          node -v
+          which google-chrome || true
+          google-chrome --version || true
+
       - name: Build ICS
         env:
           CURRICULUM_ENTRY_URL: ${{ secrets.CURRICULUM_ENTRY_URL }}
-          CURRICULUM_ACCESS_TOKEN: ${{ secrets.CURRICULUM_ACCESS_TOKEN }}
-          CURRICULUM_USER_ID: ${{ secrets.CURRICULUM_USER_ID }}
-          CURRICULUM_USER_TYPE: ${{ secrets.CURRICULUM_USER_TYPE }}
           SSO_USERNAME: ${{ secrets.SSO_USERNAME }}
           SSO_PASSWORD: ${{ secrets.SSO_PASSWORD }}
+          CURRICULUM_CHROME_BIN: /usr/bin/google-chrome
           CURRICULUM_OUTPUT: curriculum.ics
           CURRICULUM_CALENDAR_NAME: 课程表
         run: |
