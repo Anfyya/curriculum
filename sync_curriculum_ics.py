@@ -1,21 +1,41 @@
 #!/usr/bin/env python3
+"""
+sync_curriculum_ics.py  v3.0
+
+自动同步江西工程学院教务系统课程表，生成 .ics 日历文件。
+无需 accessToken，通过 Playwright 浏览器自动完成 SSO + aTrust 认证。
+
+环境变量:
+  SSO_USERNAME             - SSO 用户名（学号）    [必须]
+  SSO_PASSWORD             - SSO 密码              [必须]
+  CURRICULUM_OUTPUT        - 输出文件路径           [默认 curriculum.ics]
+  CURRICULUM_CALENDAR_NAME - 日历名称              [默认 课程表]
+"""
 import base64
 import hashlib
-import html
 import http.cookiejar
 import json
 import os
+import random
 import re
 import ssl
 import sys
+import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, date
-from typing import Dict, List, Tuple, Optional, Iterable
+from typing import Dict, List, Tuple, Iterable
 
 TZ_UTC = timezone.utc
 TZ_CST = timezone(timedelta(hours=8))
+
+_PORTAL_ORIGIN = "https://0xr.jxec.edu.cn:10443"
+_SSO_ORIGIN = "https://sso.jxec.edu.cn:10445"
+_JW_ORIGIN = "https://jiaowu.jxec.edu.cn:19995"
+_JW_BACKEND = "https://jiaowu.jxec.edu.cn:19090"
+_CAS_SERVICE = f"{_JW_BACKEND}/api/cas/login?pattern=teacher-login"
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
 
 DEFAULT_PERIOD_TIMES = {
     1: ("08:00", "08:45"),
@@ -34,7 +54,6 @@ DEFAULT_PERIOD_TIMES = {
     14: ("23:35", "00:20"),
 }
 
-# 指定节次区间的时间覆盖（优先于 period_times.json）
 PERIOD_RANGE_OVERRIDES: Dict[Tuple[int, int], Tuple[str, str]] = {
     (1, 2): ("08:30", "09:55"),
     (3, 4): ("10:15", "11:40"),
@@ -44,166 +63,76 @@ PERIOD_RANGE_OVERRIDES: Dict[Tuple[int, int], Tuple[str, str]] = {
     (5, 8): ("14:00", "17:10"),
 }
 
-# 系统 dayOfWeek 映射：2=星期一 ... 7=星期六, 1=星期日
+# dayOfWeek: 2=Mon ... 7=Sat, 1=Sun -> Python weekday offset (Mon=0)
 DAY_OFFSET_MAP = {1: 6, 2: 0, 3: 1, 4: 2, 5: 3, 6: 4, 7: 5}
-DAY_NAME_OFFSET_MAP = {
-    "星期一": 0,
-    "星期二": 1,
-    "星期三": 2,
-    "星期四": 3,
-    "星期五": 4,
-    "星期六": 5,
-    "星期日": 6,
-    "星期天": 6,
-    "周一": 0,
-    "周二": 1,
-    "周三": 2,
-    "周四": 3,
-    "周五": 4,
-    "周六": 5,
-    "周日": 6,
-}
 
 
-@dataclass
-class Config:
-    entry_url: str
-    cookie: str
-    access_token: str
-    user_id: str
-    user_type: str
-    output_path: str
-    calendar_name: str
-    period_times: Dict[int, Tuple[str, str]]
+# ---------------------------------------------------------------------------
+#  RSA 加密（联奕 CAS 专用分块 RSA）
+# ---------------------------------------------------------------------------
+
+_RSA_EXPONENT = 0x010001
+_RSA_MODULUS = int(
+    "00b5eeb166e069920e80bebd1fea4829d3d1f3216f2aabe79b6c47a3c18dcee5"
+    "fd22c2e7ac519cab59198ece036dcf289ea8201e2a0b9ded307f8fb704136eae"
+    "b670286f5ad44e691005ba9ea5af04ada5367cd724b5a26fdb5120cc95b64316"
+    "04bd219c6b7d83a6f8f24b43918ea988a76f93c333aa5a20991493d4eb1117e7b1",
+    16,
+)
+_RSA_CHUNK_SIZE = 2 * ((_RSA_MODULUS.bit_length() + 15) // 16)
 
 
-class ApiError(RuntimeError):
-    pass
+def _rsa_encrypt_block(plaintext: str) -> str:
+    codes = [ord(ch) for ch in plaintext]
+    while len(codes) % _RSA_CHUNK_SIZE != 0:
+        codes.append(0)
+    digits: List[int] = []
+    for i in range(0, len(codes), 2):
+        digits.append(codes[i] | (codes[i + 1] << 8))
+    m = 0
+    for i in range(len(digits) - 1, -1, -1):
+        m = (m << 16) | digits[i]
+    c = pow(m, _RSA_EXPONENT, _RSA_MODULUS)
+    hex_len = (_RSA_MODULUS.bit_length() + 3) // 4
+    return format(c, f"0{hex_len}x")
 
 
-def normalize_cookie(raw_cookie: str) -> str:
-    s = (raw_cookie or "").lstrip("\ufeff").strip()
-    if not s:
-        return ""
-    if s.lower().startswith("cookie:"):
-        s = s.split(":", 1)[1].strip()
-    s = s.replace("\r", ";").replace("\n", ";")
-    parts = []
-    for p in s.split(";"):
-        p = p.strip()
-        if not p or "=" not in p:
-            continue
-        k, v = p.split("=", 1)
-        k = k.strip()
-        v = v.strip()
-        if not k:
-            continue
-        parts.append(f"{k}={v}")
-    return "; ".join(parts)
+def _solve_captcha_expr(text: str) -> str:
+    text = text.strip().rstrip("=").strip()
+    text = text.replace("\u00d7", "*").replace("x", "*").replace("X", "*").replace("\u00f7", "/")
+    try:
+        return str(int(eval(text, {"__builtins__": {}})))
+    except Exception:
+        return text
 
 
-def env(name: str, default: Optional[str] = None, required: bool = False) -> str:
-    val = os.getenv(name, default)
-    if required and (val is None or str(val).strip() == ""):
-        raise RuntimeError(f"缺少环境变量: {name}")
-    return "" if val is None else str(val)
+def _build_ssl_context() -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
 
-def normalize_entry_url(entry_url: str) -> str:
-    normalized = html.unescape((entry_url or "").strip()).replace("&amp;", "&")
-    if not normalized:
-        return ""
-    split = urllib.parse.urlsplit(normalized)
-    path = urllib.parse.quote(split.path, safe="/%:@!$&'()*+,;=-._~")
-    query = urllib.parse.quote(split.query, safe="=&%:@!$'()*+,;/?-._~")
-    fragment = urllib.parse.quote(split.fragment, safe="=&%:@!$'()*+,;/?-._~")
-    return urllib.parse.urlunsplit((split.scheme, split.netloc, path, query, fragment))
+# ---------------------------------------------------------------------------
+#  工具函数
+# ---------------------------------------------------------------------------
 
-
-def parse_entry(entry_url: str) -> Dict[str, str]:
-    normalized = html.unescape((entry_url or "").strip()).replace("&amp;", "&")
-    q = urllib.parse.parse_qs(urllib.parse.urlsplit(normalized).query)
-
-    def first(*keys: str) -> str:
-        for key in keys:
-            vals = q.get(key)
-            if vals and vals[0]:
-                return vals[0]
-        return ""
-
-    result = {
-        "accessToken": first("accessToken", "amp;accessToken"),
-        "id": first("id", "amp;id"),
-        "userType": first("userType", "amp;userType"),
-    }
-
-    app_url = first("appUrl", "amp;appUrl")
-    if app_url and (not result["accessToken"] or not result["id"]):
-        decoded_app = html.unescape(urllib.parse.unquote(app_url))
-        aq = urllib.parse.parse_qs(urllib.parse.urlsplit(decoded_app).query)
-        if not result["accessToken"]:
-            result["accessToken"] = (aq.get("accessToken") or [""])[0]
-        if not result["id"]:
-            result["id"] = (aq.get("id") or [""])[0]
-        if not result["userType"]:
-            result["userType"] = (aq.get("userType") or [""])[0]
-
-    if not result["accessToken"]:
-        m = re.search(r"(?:^|[?&])accessToken=([^&\s]+)", normalized)
-        if m:
-            result["accessToken"] = urllib.parse.unquote(m.group(1))
-    if not result["id"]:
-        m = re.search(r"(?:^|[?&])id=([^&\s]+)", normalized)
-        if m:
-            result["id"] = urllib.parse.unquote(m.group(1))
-    if not result["userType"]:
-        m = re.search(r"(?:^|[?&])userType=([^&\s]+)", normalized)
-        if m:
-            result["userType"] = urllib.parse.unquote(m.group(1))
-
-    return result
-
-
-def normalize_teacher(name: str) -> str:
-    if not name:
-        return ""
-    parts = [p.strip() for p in re.split(r"[,，、/]+", name) if p.strip()]
-    dedup = []
-    seen = set()
-    for p in parts:
-        if p not in seen:
-            seen.add(p)
-            dedup.append(p)
-    return "、".join(dedup)
-
-
-def safe_int(v: object) -> Optional[int]:
-    if v is None:
-        return None
-    m = re.search(r"\d+", str(v))
-    if not m:
-        return None
-    return int(m.group(0))
-
-
-def parse_periods(v: object) -> List[int]:
+def parse_periods(v) -> List[int]:
     if v is None:
         return []
-    nums = [int(x) for x in re.findall(r"\d+", str(v))]
-    return sorted(set(nums))
+    return sorted(set(int(x) for x in re.findall(r"\d+", str(v))))
 
 
 def parse_weeks_expr(expr: str, max_week: int) -> List[int]:
     if not expr:
         return []
-    expr = expr.strip()
-    out = set()
-    for seg in re.split(r"[;；]+", expr):
+    out: set = set()
+    for seg in re.split(r"[;\uff1b]+", expr.strip()):
         seg = seg.strip()
         if not seg:
             continue
-        odd_only = "单" in seg
-        even_only = "双" in seg
+        odd_only = "\u5355" in seg
+        even_only = "\u53cc" in seg
         core = re.sub(r"[^0-9\-]", "", seg)
         if not core:
             continue
@@ -216,15 +145,13 @@ def parse_weeks_expr(expr: str, max_week: int) -> List[int]:
                 start, end = end, start
         else:
             start = end = int(core)
-
         for w in range(start, end + 1):
-            if w < 1 or w > max_week:
-                continue
-            if odd_only and w % 2 == 0:
-                continue
-            if even_only and w % 2 != 0:
-                continue
-            out.add(w)
+            if 1 <= w <= max_week:
+                if odd_only and w % 2 == 0:
+                    continue
+                if even_only and w % 2 != 0:
+                    continue
+                out.add(w)
     return sorted(out)
 
 
@@ -233,8 +160,7 @@ def merge_periods(periods: Iterable[int]) -> List[Tuple[int, int]]:
     if not arr:
         return []
     merged = []
-    s = arr[0]
-    e = arr[0]
+    s = e = arr[0]
     for p in arr[1:]:
         if p == e + 1:
             e = p
@@ -245,31 +171,33 @@ def merge_periods(periods: Iterable[int]) -> List[Tuple[int, int]]:
     return merged
 
 
-def minutes_to_hhmm(total_minutes: int) -> str:
-    total_minutes %= (24 * 60)
-    h = total_minutes // 60
-    m = total_minutes % 60
-    return f"{h:02d}:{m:02d}"
-
-
-def fallback_period_time(period: int) -> Tuple[str, str]:
-    start = 8 * 60 + (period - 1) * 55
-    end = start + 45
-    return minutes_to_hhmm(start), minutes_to_hhmm(end)
-
-
-def period_range_time(start_period: int, end_period: int, period_map: Dict[int, Tuple[str, str]]) -> Tuple[str, str]:
-    override = PERIOD_RANGE_OVERRIDES.get((start_period, end_period))
+def period_range_time(start_p: int, end_p: int,
+                      period_map: Dict[int, Tuple[str, str]]) -> Tuple[str, str]:
+    override = PERIOD_RANGE_OVERRIDES.get((start_p, end_p))
     if override:
         return override
-    st = period_map.get(start_period, fallback_period_time(start_period))[0]
-    et = period_map.get(end_period, fallback_period_time(end_period))[1]
+
+    def _fallback(p: int) -> Tuple[str, str]:
+        s = 8 * 60 + (p - 1) * 55
+        return (f"{s // 60:02d}:{s % 60:02d}",
+                f"{(s + 45) // 60:02d}:{(s + 45) % 60:02d}")
+
+    st = period_map.get(start_p, _fallback(start_p))[0]
+    et = period_map.get(end_p, _fallback(end_p))[1]
     return st, et
 
 
-def parse_hhmm_to_dt(d: date, hhmm: str) -> datetime:
-    h, m = hhmm.split(":", 1)
-    return datetime(d.year, d.month, d.day, int(h), int(m), 0, tzinfo=TZ_CST)
+def normalize_teacher(name: str) -> str:
+    if not name:
+        return ""
+    parts = [p.strip() for p in re.split(r"[,\uff0c\u3001/]+", name) if p.strip()]
+    dedup: List[str] = []
+    seen: set = set()
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            dedup.append(p)
+    return "\u3001".join(dedup)
 
 
 def ics_escape(s: str) -> str:
@@ -287,466 +215,327 @@ def load_period_map() -> Dict[int, Tuple[str, str]]:
     if inline:
         obj = json.loads(inline.lstrip("\ufeff"))
         return {int(k): (str(v[0]), str(v[1])) for k, v in obj.items()}
-
     path = os.getenv("CURRICULUM_PERIOD_TIMES_FILE", "period_times.json")
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8-sig") as f:
             obj = json.load(f)
         return {int(k): (str(v[0]), str(v[1])) for k, v in obj.items()}
-
     return dict(DEFAULT_PERIOD_TIMES)
 
 
 # ---------------------------------------------------------------------------
-#  SSO 自动登录（联奕 CAS）
+#  Phase 1: 门户认证 + aTrust 隧道 (urllib)
 # ---------------------------------------------------------------------------
 
-_RSA_EXPONENT = 0x010001
-_RSA_MODULUS = int(
-    "00b5eeb166e069920e80bebd1fea4829d3d1f3216f2aabe79b6c47a3c18dcee5"
-    "fd22c2e7ac519cab59198ece036dcf289ea8201e2a0b9ded307f8fb704136eae"
-    "b670286f5ad44e691005ba9ea5af04ada5367cd724b5a26fdb5120cc95b64316"
-    "04bd219c6b7d83a6f8f24b43918ea988a76f93c333aa5a20991493d4eb1117e7b1",
-    16,
-)
-_RSA_CHUNK_SIZE = 2 * ((_RSA_MODULUS.bit_length() + 15) // 16)
-
-_SSO_ORIGIN = "https://sso.jxec.edu.cn:10445"
-_PORTAL_ORIGIN = "https://0xr.jxec.edu.cn:10443"
-_CAS_SERVICE = _PORTAL_ORIGIN + "/passport/v1/auth/cas?sfDomain=1"
-
-
-def _rsa_encrypt_block(plaintext: str) -> str:
-    codes = [ord(ch) for ch in plaintext]
-    while len(codes) % _RSA_CHUNK_SIZE != 0:
-        codes.append(0)
-
-    digits: List[int] = []
-    for i in range(0, len(codes), 2):
-        digits.append(codes[i] | (codes[i + 1] << 8))
-
-    m = 0
-    for i in range(len(digits) - 1, -1, -1):
-        m = (m << 16) | digits[i]
-
-    c = pow(m, _RSA_EXPONENT, _RSA_MODULUS)
-
-    hex_len = (_RSA_MODULUS.bit_length() + 3) // 4
-    return format(c, f"0{hex_len}x")
-
-
-def _solve_captcha_expr(text: str) -> str:
-    text = text.strip().rstrip("=").strip()
-    text = text.replace("×", "*").replace("x", "*").replace("X", "*").replace("÷", "/")
-    try:
-        result = eval(text, {"__builtins__": {}})
-        return str(int(result))
-    except Exception:
-        return text
-
-
-def _build_ssl_context() -> ssl.SSLContext:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
-
-
-def auto_login(username: str, password: str, entry_url: str = "", max_retries: int = 5) -> str:
-    try:
-        import ddddocr  # type: ignore
-    except ImportError:
-        raise RuntimeError("auto_login 需要 ddddocr，请先 pip install ddddocr")
-
-    ocr = ddddocr.DdddOcr(show_ad=False)
-    ssl_ctx = _build_ssl_context()
-
-    cas_name = "/lyuapServer"
-    encrypted_pwd = _rsa_encrypt_block(password)
-
+def _sso_login(opener, ocr, encrypted_pwd: str, username: str,
+               service: str, max_retries: int = 8) -> str:
     for attempt in range(1, max_retries + 1):
-        # --- 1. 获取验证码 ---
-        kaptcha_url = f"{_SSO_ORIGIN}{cas_name}/kaptcha?uid=&sf_request_type=ajax"
-        req = urllib.request.Request(kaptcha_url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        })
-        try:
-            with urllib.request.urlopen(req, timeout=30, context=ssl_ctx) as resp:
-                kdata = json.loads(resp.read().decode("utf-8-sig"))
-        except Exception as e:
-            print(f"  auto_login 尝试 {attempt}/{max_retries}：获取验证码失败: {e}")
-            if attempt < max_retries:
-                continue
-            raise
+        req = urllib.request.Request(
+            f"{_SSO_ORIGIN}/lyuapServer/kaptcha?uid=&sf_request_type=ajax",
+            headers={"User-Agent": _UA})
+        with opener.open(req, timeout=30) as resp:
+            kdata = json.loads(resp.read().decode("utf-8-sig"))
 
         uid = kdata["uid"]
         img_b64 = kdata["content"].split(",", 1)[1]
-        img_bytes = base64.b64decode(img_b64)
-
-        # --- 2. OCR 识别验证码 ---
-        raw_text = ocr.classification(img_bytes)
+        raw_text = ocr.classification(base64.b64decode(img_b64))
         code = _solve_captcha_expr(raw_text)
-        print(f"  auto_login 尝试 {attempt}/{max_retries}：OCR={raw_text!r} → code={code}")
+        print(f"  SSO 尝试 {attempt}/{max_retries}: OCR={raw_text!r} -> {code}")
 
-        # --- 3. POST 登录 ---
-        login_url = f"{_SSO_ORIGIN}{cas_name}/v1/tickets?sf_request_type=ajax"
         form = urllib.parse.urlencode({
-            "username": username,
-            "password": encrypted_pwd,
-            "service": _CAS_SERVICE,
-            "loginType": "",
-            "id": uid,
-            "code": code,
-            "otpcode": "",
-        }).encode("utf-8")
-        req = urllib.request.Request(login_url, data=form, method="POST", headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        })
-        with urllib.request.urlopen(req, timeout=30, context=ssl_ctx) as resp:
-            login_body = resp.read().decode("utf-8-sig")
+            "username": username, "password": encrypted_pwd,
+            "service": service, "loginType": "",
+            "id": uid, "code": code, "otpcode": "",
+        }).encode()
+        req = urllib.request.Request(
+            f"{_SSO_ORIGIN}/lyuapServer/v1/tickets?sf_request_type=ajax",
+            data=form, method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     "User-Agent": _UA})
+        with opener.open(req, timeout=30) as resp:
+            lr = json.loads(resp.read().decode("utf-8-sig"))
 
-        login_resp = json.loads(login_body)
-
-        # --- 兼容两种格式：顶层直接有 ticket，或包在 data 里 ---
-        ticket = login_resp.get("ticket") or login_resp.get("data", {})
+        ticket = lr.get("ticket") or lr.get("data", {})
         if isinstance(ticket, dict):
-            err_code = ticket.get("code", "")
-            if err_code == "CODEFALSE":
-                print(f"  验证码错误，重试...")
+            if ticket.get("code") == "CODEFALSE":
                 continue
-            elif err_code == "BINDPHONE":
-                raise RuntimeError("SSO 要求绑定手机，无法自动登录")
-            elif err_code:
-                raise RuntimeError(f"SSO 登录返回错误码: {err_code}")
-            ticket = ticket.get("ticket") or ""
-        if not ticket or not str(ticket).startswith("ST-"):
-            raise RuntimeError(f"SSO 登录返回未知格式: {login_body[:300]}")
-        ticket = str(ticket)
+            ticket = ticket.get("ticket", "")
+        if ticket and str(ticket).startswith("ST-"):
+            return str(ticket)
 
-        print(f"  SSO 登录成功，获取到 ticket")
-
-        # --- 4. 用 ticket 换取门户 Cookie ---
-        cj = http.cookiejar.CookieJar()
-
-        class _DebugRedirectHandler(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, req, fp, code, msg, headers, newurl):
-                print(f"    [REDIR] {code} {req.full_url[:120]}")
-                print(f"         -> {newurl[:150]}")
-                for hk, hv in headers.items():
-                    hl = hk.lower()
-                    if "cookie" in hl or "location" in hl:
-                        print(f"         {hk}: {hv[:200]}")
-                return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-        opener = urllib.request.build_opener(
-            _DebugRedirectHandler,
-            urllib.request.HTTPCookieProcessor(cj),
-            urllib.request.HTTPSHandler(context=ssl_ctx),
-        )
-        _UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-
-        callback_url = f"{_CAS_SERVICE}&ticket={urllib.parse.quote(ticket, safe='')}"
-        print(f"  CAS 回调: {callback_url[:120]}")
-        req = urllib.request.Request(callback_url, headers=_UA)
-        try:
-            resp = opener.open(req, timeout=30)
-            print(f"  CAS 回调结束: status={resp.status} url={resp.geturl()[:120]}")
-        except urllib.error.HTTPError as e:
-            print(f"  CAS 回调 HTTPError: {e.code}")
-
-        portal_cookies = {c.name: c for c in cj}
-        print(f"  门户 Cookie ({len(portal_cookies)} 项): {list(portal_cookies.keys())}")
-
-        # --- 5. 激活门户会话 (secondary_auth → online) ---
-        #  注意: 请求中不能带 x-sdp-traceid 头，否则网关会在 secondary_auth 状态下返回 401
-        _portal_host = urllib.parse.urlsplit(_PORTAL_ORIGIN).netloc
-        _x_sdp_rid = base64.b64encode(_portal_host.encode()).decode()
-        _base_params = {"clientType": "SDPBrowserClient", "platform": "Windows", "lang": "zh-CN"}
-
-        def _portal_api(method, path, params=None, body=None, csrf=""):
-            url = f"{_PORTAL_ORIGIN}{path}"
-            if params:
-                url += "?" + urllib.parse.urlencode(params)
-            hdrs = {**_UA, "Accept": "application/json, text/plain, */*",
-                    "Referer": f"{_PORTAL_ORIGIN}/portal/shortcut.html",
-                    "Origin": _PORTAL_ORIGIN, "x-sdp-rid": _x_sdp_rid}
-            if csrf:
-                hdrs["x-csrf-token"] = csrf
-            raw_body = None
-            if body is not None:
-                raw_body = json.dumps(body).encode()
-                hdrs["Content-Type"] = "application/json"
-            r = urllib.request.Request(url, data=raw_body, method=method, headers=hdrs)
-            try:
-                rsp = opener.open(r, timeout=15)
-                return rsp.status, json.loads(rsp.read().decode("utf-8", errors="replace"))
-            except urllib.error.HTTPError as e:
-                txt = e.read().decode("utf-8", errors="replace") if e.fp else ""
-                try:
-                    return e.code, json.loads(txt)
-                except Exception:
-                    return e.code, {"raw": txt[:300]}
-
-        # 5a. 获取 CSRF token
-        st, cfg = _portal_api("GET", "/passport/v1/public/authConfig",
-                              {"mod": "1", "sfDomain": "1", **_base_params})
-        csrf_token = ""
-        if st == 200 and isinstance(cfg.get("data"), dict):
-            csrf_token = cfg["data"].get("security", {}).get("csrfToken", "")
-        print(f"  authConfig: status={st}, CSRF={'OK' if csrf_token else 'MISSING'}")
-
-        # 5b. reportEnv (上报浏览器环境)
-        import random as _rnd, time as _tm
-        _dev_id = hashlib.md5(f"{_rnd.random()}{_tm.time()}".encode()).hexdigest()
-        _portal_ticket = ""
-        for _c in cj:
-            if _c.name == "sid":
-                _portal_ticket = _c.value
-                break
-        st2, _ = _portal_api("POST", "/controller/v1/public/reportEnv",
-                             params=_base_params, csrf=csrf_token,
-                             body={"ticket": _portal_ticket, "deviceId": _dev_id,
-                                   "env": {"endpoint": {"device_id": _dev_id,
-                                                        "device": {"type": "browser"}}}})
-        print(f"  reportEnv: status={st2}")
-
-        # 5c. authCheck → 获取 sidTicket
-        st3, ac_resp = _portal_api("GET", "/passport/v1/auth/authCheck",
-                                   params=_base_params, csrf=csrf_token)
-        sid_ticket = ""
-        if st3 == 200 and isinstance(ac_resp.get("data"), dict):
-            sid_ticket = ac_resp["data"].get("sidTicket", "")
-        print(f"  authCheck: status={st3}, sidTicket={'OK' if sid_ticket else 'MISSING'}")
-
-        # 5d. sessionIdExchange → 激活会话
-        if sid_ticket:
-            st4, ex_resp = _portal_api("POST", "/passport/v1/public/sessionIdExchange",
-                                       params=_base_params, csrf=csrf_token,
-                                       body={"sidTicket": sid_ticket})
-            print(f"  sessionIdExchange: status={st4}")
-        else:
-            print(f"  跳过 sessionIdExchange (无 sidTicket)")
-
-        # 检查会话状态
-        auth_tag = ""
-        for _c in cj:
-            if _c.name == "sdp_limit_auth_tag":
-                auth_tag = _c.value
-        print(f"  会话状态: sdp_limit_auth_tag={auth_tag}")
-
-        # --- 6. 访问课表入口 URL，跟着 aTrust 重定向拿到目标域名的 sdp_app_session ---
-        if entry_url:
-            target_host = urllib.parse.urlsplit(entry_url).hostname  # e.g. zichan.jxec.edu.cn
-            print(f"  正在建立 {target_host} 的会话 (跟随 aTrust 重定向)...")
-            req = urllib.request.Request(entry_url, headers=_UA)
-            try:
-                resp = opener.open(req, timeout=30)
-                final_url = resp.geturl()
-                body_preview = resp.read(2000).decode("utf-8", errors="replace")
-                print(f"  重定向结束: status={resp.status} final_url={final_url[:150]}")
-            except urllib.error.HTTPError as e:
-                print(f"  重定向链 HTTPError: {e.code} {e.url[:150] if e.url else ''}")
-            except urllib.error.URLError as e:
-                print(f"  重定向链 URLError: {e.reason}")
-            except Exception as e:
-                print(f"  重定向链异常: {type(e).__name__}: {e}")
-
-            # 只收集目标域名的 cookie
-            target_cookies = [c for c in cj if target_host and target_host in c.domain]
-            app_session = [c for c in target_cookies if "sdp_app_session" in c.name]
-            if app_session:
-                print(f"  aTrust 会话建立成功: {[c.name for c in app_session]}")
-            else:
-                print(f"  警告: 未获取到 sdp_app_session cookie (目标域名 {target_host} 共 {len(target_cookies)} 个 cookie)")
-                for c in cj:
-                    print(f"    [{c.domain}] {c.name}")
-
-            cookie_parts = [f"{c.name}={c.value}" for c in target_cookies]
-        else:
-            cookie_parts = [f"{c.name}={c.value}" for c in cj]
-
-        if not cookie_parts:
-            raise RuntimeError("未获取到目标域名的 Cookie，aTrust 重定向可能失败")
-
-        cookie_str = "; ".join(cookie_parts)
-        print(f"  最终 Cookie ({len(cookie_parts)} 项)")
-        return cookie_str
-
-    raise RuntimeError(f"验证码识别连续 {max_retries} 次失败，请检查 ddddocr 或手动登录")
+    raise RuntimeError(f"SSO 登录失败：验证码识别连续 {max_retries} 次未通过")
 
 
-def build_config() -> Config:
-    entry_url_raw = env("CURRICULUM_ENTRY_URL", required=True)
-    entry_url = normalize_entry_url(entry_url_raw)
-    parsed = parse_entry(entry_url_raw)
+def portal_auth(username: str, password: str, ocr) -> http.cookiejar.CookieJar:
+    ssl_ctx = _build_ssl_context()
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(cj),
+        urllib.request.HTTPSHandler(context=ssl_ctx))
+    encrypted_pwd = _rsa_encrypt_block(password)
 
-    access_token = env("CURRICULUM_ACCESS_TOKEN", parsed.get("accessToken") or "", required=False).strip()
-    # 容错：如果用户把 "accessToken=xxx" 整个粘贴为值，去掉前缀
-    if access_token.startswith("accessToken="):
-        access_token = access_token[len("accessToken="):]
-    if not access_token:
-        raise RuntimeError("缺少 accessToken：请设置 CURRICULUM_ACCESS_TOKEN，或在 CURRICULUM_ENTRY_URL 中带上 accessToken 参数")
+    # 1. SSO 登录 -> 门户 ticket
+    portal_cas = f"{_PORTAL_ORIGIN}/passport/v1/auth/cas?sfDomain=1"
+    ticket = _sso_login(opener, ocr, encrypted_pwd, username, portal_cas)
+    print("  门户 SSO ticket 获取成功")
 
-    user_id = env("CURRICULUM_USER_ID", parsed.get("id") or "", required=False).strip()
-    if not user_id:
-        raise RuntimeError("缺少 userId：请设置 CURRICULUM_USER_ID，或在 CURRICULUM_ENTRY_URL 中带上 id 参数")
-
-    user_type = env("CURRICULUM_USER_TYPE", parsed.get("userType") or "0", required=False).strip() or "0"
-
-    cookie_raw = env("CURRICULUM_COOKIE", "").strip()
-    sso_user = env("SSO_USERNAME", "").strip()
-    sso_pass = env("SSO_PASSWORD", "").strip()
-
-    if cookie_raw:
-        cookie = normalize_cookie(cookie_raw)
-    elif sso_user and sso_pass:
-        print("CURRICULUM_COOKIE 未设置，使用 SSO_USERNAME/SSO_PASSWORD 自动登录...")
-        cookie = auto_login(sso_user, sso_pass, entry_url=entry_url)
-    else:
-        raise RuntimeError(
-            "缺少登录凭据：请设置 CURRICULUM_COOKIE，或同时设置 SSO_USERNAME 和 SSO_PASSWORD"
-        )
-
-    if not cookie:
-        raise RuntimeError("Cookie 为空或格式无效")
-
-    output_path = env("CURRICULUM_OUTPUT", "curriculum.ics")
-    calendar_name = env("CURRICULUM_CALENDAR_NAME", "课程表")
-
-    return Config(
-        entry_url=entry_url,
-        cookie=cookie,
-        access_token=access_token,
-        user_id=user_id,
-        user_type=user_type,
-        output_path=output_path,
-        calendar_name=calendar_name,
-        period_times=load_period_map(),
-    )
-
-
-def request_json(origin: str, headers: Dict[str, str], method: str, path: str, data: Optional[dict] = None) -> dict:
-    body = None
-    req_headers = dict(headers)
-    if data is not None:
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        req_headers["Content-Type"] = "application/json;charset=UTF-8"
-
-    req = urllib.request.Request(origin + path, data=body, headers=req_headers, method=method)
+    # 2. CAS 回调
     try:
-        resp = urllib.request.urlopen(req, timeout=45, context=_build_ssl_context())
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")[:500] if e.fp else ""
-        err_url = e.url or (origin + path)
-        print(f"  API请求失败: {e.code} {path}")
-        print(f"    URL: {err_url[:200]}")
-        print(f"    响应头: { {k: v for k, v in (e.headers.items() if e.headers else [])} }")
-        print(f"    响应体: {err_body[:300]}")
-        raise
-    with resp:
-        raw = resp.read().decode("utf-8-sig", "replace").lstrip("\ufeff")
-        ct = (resp.headers.get("Content-Type") or "").lower()
-        final_url = resp.geturl()
-
-    if "json" not in ct and not raw.strip().startswith("{"):
-        preview = re.sub(r"\s+", " ", raw[:120]).strip()
-        raise ApiError(
-            f"接口返回非 JSON，可能登录态失效: {path} final_url={final_url} content_type={ct or '-'} preview={preview}"
-        )
-
-    try:
-        obj = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ApiError(f"接口 JSON 解析失败: {path}, {e}") from e
-
-    if obj.get("code") != 200:
-        raise ApiError(f"接口返回异常 code={obj.get('code')} path={path} message={obj.get('message')}")
-
-    return obj
-
-
-def day_offset(row: dict) -> Optional[int]:
-    day_num = safe_int(row.get("dayOfWeek"))
-    if day_num in DAY_OFFSET_MAP:
-        return DAY_OFFSET_MAP[day_num]
-    day_name = str(row.get("dayOfWeekName") or "").strip()
-    return DAY_NAME_OFFSET_MAP.get(day_name)
-
-
-def build_ics(config: Config) -> Tuple[str, int]:
-    origin = urllib.parse.urlsplit(config.entry_url).scheme + "://" + urllib.parse.urlsplit(config.entry_url).netloc
-    headers = {
-        "accessToken": config.access_token,
-        "Cookie": config.cookie,
-        "Origin": origin,
-        "Referer": config.entry_url,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty",
-    }
-
-    current = request_json(origin, headers, "GET", "/api/baseInfo/mobile/common/selectCurrentInfo").get("data", {})
-    current_week = int(current.get("currentWeek") or 1)
-    semester = str(current.get("currentSemester") or "")
-
-    week_data = request_json(origin, headers, "GET", "/api/baseInfo/mobile/common/queryCurrentSemesterWeekList").get("data", [])
-    week_codes = sorted({int(w.get("code") or w.get("value") or 0) for w in week_data if safe_int(w.get("code") or w.get("value"))})
-    if not week_codes:
-        week_codes = [current_week]
-    max_week = max(week_codes)
-
-    rows: List[dict] = []
-    # 避免一次请求整学期导致后端把不同周次课程错误合并，改为逐周拉取后汇总
-    for week_code in week_codes:
-        payload = {
-            "academicYearSemester": semester,
-            "userId": config.user_id,
-            "userType": config.user_type,
-            "weeks": [week_code],
-        }
-        schedule = request_json(origin, headers, "POST", "/api/arrange/mobile/courseSchedule/courseSchedule", payload).get("data", {})
-        for r in schedule.get("course", []):
-            if not str(r.get("courseName") or "").strip():
-                continue
-            rr = dict(r)
-            rr["_week_code"] = week_code
-            rows.append(rr)
-
-    today_iso = None
-    try:
-        idx = request_json(origin, headers, "POST", "/api/arrange/mobile/courseSchedule/indexCourseSchedule", {
-            "academicYearSemester": semester,
-            "userId": config.user_id,
-            "userType": config.user_type,
-            "weeks": [current_week],
-        }).get("data", {})
-        today_iso = idx.get("todayTime")
+        opener.open(urllib.request.Request(
+            f"{portal_cas}&ticket={urllib.parse.quote(ticket, safe='')}",
+            headers={"User-Agent": _UA}), timeout=30)
     except Exception:
-        today_iso = None
+        pass
 
-    if today_iso:
-        today_date = date.fromisoformat(today_iso)
-    else:
-        today_date = datetime.now(TZ_CST).date()
+    # 3. 门户激活
+    host = urllib.parse.urlsplit(_PORTAL_ORIGIN).netloc
+    xr = base64.b64encode(host.encode()).decode()
+    bp = {"clientType": "SDPBrowserClient", "platform": "Windows", "lang": "zh-CN"}
 
-    current_week_monday = today_date - timedelta(days=today_date.weekday())
+    def _papi(method, path, params=None, body=None, csrf=""):
+        url = f"{_PORTAL_ORIGIN}{path}?" + urllib.parse.urlencode(
+            {**bp, **(params or {})})
+        hdrs = {"User-Agent": _UA, "Accept": "application/json",
+                "Referer": f"{_PORTAL_ORIGIN}/portal/shortcut.html",
+                "Origin": _PORTAL_ORIGIN, "x-sdp-rid": xr}
+        if csrf:
+            hdrs["x-csrf-token"] = csrf
+        rb = json.dumps(body).encode() if body else None
+        if rb:
+            hdrs["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=rb, method=method, headers=hdrs)
+        try:
+            with opener.open(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            try:
+                return json.loads(e.read().decode("utf-8", "replace"))
+            except Exception:
+                return {}
 
-    grouped: Dict[Tuple[str, str, str, int, str, str], set] = {}
+    cfg = _papi("GET", "/passport/v1/public/authConfig",
+                {"mod": "1", "sfDomain": "1"})
+    csrf = cfg.get("data", {}).get("security", {}).get("csrfToken", "")
+
+    sid_val = next((c.value for c in cj if c.name == "sid"), "")
+    dev_id = hashlib.md5(f"{random.random()}{time.time()}".encode()).hexdigest()
+    _papi("POST", "/controller/v1/public/reportEnv", csrf=csrf,
+          body={"ticket": sid_val, "deviceId": dev_id,
+                "env": {"endpoint": {"device_id": dev_id,
+                                     "device": {"type": "browser"}}}})
+
+    ac = _papi("GET", "/passport/v1/auth/authCheck", csrf=csrf)
+    sid_ticket = ac.get("data", {}).get("sidTicket", "")
+    if sid_ticket:
+        _papi("POST", "/passport/v1/public/sessionIdExchange", csrf=csrf,
+              body={"sidTicket": sid_ticket})
+
+    # 4. 建立教务系统隧道
+    opener.open(urllib.request.Request(
+        f"{_JW_ORIGIN}/", headers={"User-Agent": _UA}), timeout=30).read()
+    print("  门户认证 + 隧道建立完成")
+    return cj
+
+
+# ---------------------------------------------------------------------------
+#  Phase 2: Playwright 浏览器 SPA 认证 + 数据捕获
+# ---------------------------------------------------------------------------
+
+def fetch_schedule_data(cj: http.cookiejar.CookieJar, username: str,
+                        password: str, ocr) -> Tuple[dict, List[int], list]:
+    from playwright.sync_api import sync_playwright
+
+    encrypted_pwd = _rsa_encrypt_block(password)
+
+    # 转移 Cookie（排除 LYSESSIONID / user，由浏览器 CAS 获取）
+    pw_cookies = []
+    for c in cj:
+        if c.name in ("LYSESSIONID", "user"):
+            continue
+        pw_cookies.append({
+            "name": c.name, "value": c.value,
+            "domain": c.domain, "path": c.path or "/", "secure": True,
+        })
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context(ignore_https_errors=True, user_agent=_UA)
+        for c in pw_cookies:
+            try:
+                ctx.add_cookies([c])
+            except Exception:
+                pass
+        page = ctx.new_page()
+
+        # 访问教务系统根路径（建立 sdp_app_session）
+        page.goto(f"{_JW_ORIGIN}/", timeout=60000,
+                  wait_until="domcontentloaded")
+        time.sleep(1)
+
+        # 导航到 SSO 登录页
+        page.goto(
+            f"{_SSO_ORIGIN}/lyuapServer/login"
+            f"?service={urllib.parse.quote(_CAS_SERVICE, safe='')}",
+            timeout=30000)
+
+        # 在浏览器中完成 SSO 登录
+        jw_ticket = None
+        for attempt in range(8):
+            r = page.evaluate(
+                "async()=>{const r=await fetch("
+                "'/lyuapServer/kaptcha?uid=&sf_request_type=ajax');"
+                "return await r.json()}")
+            img_b64 = r.get("content", "").split(",", 1)[-1]
+            raw_text = ocr.classification(base64.b64decode(img_b64))
+            code = _solve_captcha_expr(raw_text)
+            uid = r.get("uid", "")
+            print(f"  浏览器 SSO 尝试 {attempt + 1}/8: "
+                  f"OCR={raw_text!r} -> {code}")
+
+            lr = page.evaluate(
+                f"async()=>{{const f=new URLSearchParams({{"
+                f"username:'{username}',"
+                f"password:'{encrypted_pwd}',"
+                f"service:'{_CAS_SERVICE}',"
+                f"loginType:'',id:'{uid}',code:'{code}',otpcode:''}});"
+                f"const r=await fetch("
+                f"'/lyuapServer/v1/tickets?sf_request_type=ajax',"
+                f"{{method:'POST',headers:"
+                f"{{'Content-Type':'application/x-www-form-urlencoded'}},"
+                f"body:f.toString()}});return await r.json()}}")
+
+            ticket = lr.get("ticket") or lr.get("data", {})
+            if isinstance(ticket, dict):
+                if ticket.get("code") == "CODEFALSE":
+                    continue
+                ticket = ticket.get("ticket", "")
+            if ticket and str(ticket).startswith("ST-"):
+                jw_ticket = str(ticket)
+                break
+
+        if not jw_ticket:
+            browser.close()
+            raise RuntimeError("浏览器 SSO 登录失败")
+        print("  浏览器 SSO ticket 获取成功")
+
+        # 路由拦截：将课表请求修改为查询全部周次
+        captured: Dict[str, str] = {}
+
+        def handle_route(route):
+            req = route.request
+            if "studentCourseSchedule" in req.url and req.method == "POST":
+                try:
+                    body = json.loads(req.post_data) if req.post_data else {}
+                    body["weeks"] = list(range(1, 30))
+                    route.continue_(post_data=json.dumps(body))
+                    return
+                except Exception:
+                    pass
+            route.continue_()
+
+        page.route("**/api/**", handle_route)
+
+        # 捕获 API 响应
+        def capture_response(resp):
+            url = resp.url
+            if "/api/" not in url or "jiaowu" not in url:
+                return
+            if resp.status != 200:
+                return
+            try:
+                body = resp.text()
+            except Exception:
+                return
+            parsed = urllib.parse.urlsplit(url)
+            key = parsed.path
+            if parsed.query:
+                key += "?" + parsed.query
+            captured[key] = body
+
+        page.on("response", capture_response)
+
+        # CAS 回调 -> SPA 加载 -> 自动触发所有 API
+        cb_url = (f"{_JW_ORIGIN}/api/api/cas/login?pattern=teacher-login"
+                  f"&ticket={urllib.parse.quote(jw_ticket, safe='')}")
+        page.goto(cb_url, timeout=60000, wait_until="networkidle")
+        time.sleep(5)
+        browser.close()
+
+    print(f"  捕获到 {len(captured)} 个 API 响应")
+
+    # --- 解析学期信息 ---
+    semester_info = None
+    for key, val in captured.items():
+        if "selectCurrentXnXq" in key:
+            semester_info = json.loads(val).get("data", {})
+            break
+    if not semester_info:
+        raise RuntimeError("未获取到学期信息")
+
+    # --- 解析周次列表（优先取不带 type 参数的完整列表）---
+    all_weeks: List[int] = []
+    for key, val in captured.items():
+        if "queryWeek" in key and "type=" not in key:
+            all_weeks = json.loads(val).get("data", [])
+            break
+    if not all_weeks:
+        for key, val in captured.items():
+            if "queryWeek" in key:
+                all_weeks = json.loads(val).get("data", [])
+                break
+    if not all_weeks:
+        all_weeks = list(range(1, 20))
+
+    # --- 解析课表 ---
+    schedule_data = None
+    for key, val in captured.items():
+        if "studentCourseSchedule" in key:
+            schedule_data = json.loads(val).get("data", [])
+            break
+    if not schedule_data:
+        raise RuntimeError("未获取到课表数据")
+
+    return semester_info, all_weeks, schedule_data
+
+
+# ---------------------------------------------------------------------------
+#  Phase 3: 生成 ICS
+# ---------------------------------------------------------------------------
+
+def generate_ics(semester_info: dict, all_weeks: List[int],
+                 schedule_data: list,
+                 period_map: Dict[int, Tuple[str, str]],
+                 calendar_name: str) -> Tuple[str, int]:
+    semester = semester_info.get("semester", "")
+    start_date_str = semester_info.get("ksrq", "")
+    if not start_date_str:
+        raise RuntimeError("学期开始日期缺失")
+
+    week1_monday = date.fromisoformat(start_date_str)
+    week1_monday -= timedelta(days=week1_monday.weekday())
+    max_week = max(all_weeks) if all_weeks else 19
+
+    # 从 SPA 响应提取课程行
+    rows: List[dict] = []
+    for item in schedule_data:
+        for course in item.get("courseList", []):
+            if not str(course.get("courseName", "")).strip():
+                continue
+            rows.append(course)
+
+    # 按 (课程, 教师, 教室, dayOfWeek, 周次, 班级) 分组合并节次
+    grouped: Dict[Tuple, set] = {}
     for r in rows:
-        offset = day_offset(r)
+        dow = int(r.get("dayOfWeek", 0))
+        offset = DAY_OFFSET_MAP.get(dow)
         if offset is None:
             continue
 
-        course = str(r.get("courseName") or "").strip()
-        teacher = normalize_teacher(str(r.get("teacherName") or "").strip())
-        classroom = re.sub(r"\s+", " ", str(r.get("classroomName") or "").strip())
-        class_name = str(r.get("teachingClassName") or r.get("className") or "").strip()
-        # 单周查询时，优先用请求周号，避免使用接口返回的聚合周次字符串
-        weeks_expr = str(r.get("_week_code") or r.get("weeks") or "").strip()
+        course_name = str(r.get("courseName", "")).strip()
+        teacher = normalize_teacher(str(r.get("teacherName", "")).strip())
+        classroom = re.sub(r"\s+", " ", str(r.get("classroomName", "")).strip())
+        class_name = str(r.get("teachingClassName", "")).strip()
+        weeks_expr = str(r.get("weeks", "")).strip()
 
         periods = parse_periods(r.get("time"))
         if not periods:
@@ -754,44 +543,54 @@ def build_ics(config: Config) -> Tuple[str, int]:
         if not periods:
             continue
 
-        key = (course, teacher, classroom, offset, weeks_expr, class_name)
+        key = (course_name, teacher, classroom, offset, weeks_expr, class_name)
         grouped.setdefault(key, set()).update(periods)
 
     events = []
-    for (course, teacher, classroom, offset, weeks_expr, class_name), period_set in grouped.items():
+    for (course_name, teacher, classroom, offset, weeks_expr, class_name), \
+            period_set in grouped.items():
         week_nums = parse_weeks_expr(weeks_expr, max_week)
         if not week_nums:
-            week_nums = [current_week]
+            try:
+                week_nums = [int(weeks_expr)]
+            except ValueError:
+                continue
 
         period_ranges = merge_periods(period_set)
         for wn in week_nums:
-            day_date = current_week_monday + timedelta(days=offset + (wn - current_week) * 7)
+            day_date = week1_monday + timedelta(days=offset + (wn - 1) * 7)
             for start_p, end_p in period_ranges:
-                st_s, et_s = period_range_time(start_p, end_p, config.period_times)
-                dt_start = parse_hhmm_to_dt(day_date, st_s)
-                dt_end = parse_hhmm_to_dt(day_date, et_s)
+                st_s, et_s = period_range_time(start_p, end_p, period_map)
+                h1, m1 = st_s.split(":")
+                h2, m2 = et_s.split(":")
+                dt_start = datetime(day_date.year, day_date.month, day_date.day,
+                                    int(h1), int(m1), tzinfo=TZ_CST)
+                dt_end = datetime(day_date.year, day_date.month, day_date.day,
+                                  int(h2), int(m2), tzinfo=TZ_CST)
                 if dt_end <= dt_start:
                     dt_end += timedelta(days=1)
 
-                summary = course
-                location = classroom or "待定教室"
                 desc = "\n".join([
                     f"教师: {teacher or '待定'}",
                     f"班级: {class_name or '待定'}",
-                    f"周次规则: {weeks_expr or str(wn)}",
+                    f"周次: {weeks_expr}",
                     f"节次: 第{start_p}-{end_p}节",
                     f"学期: {semester}",
                     "来源: 江西工程学院课程系统",
                 ])
 
-                uid_seed = f"{course}|{teacher}|{classroom}|{day_date.isoformat()}|{start_p}-{end_p}|{weeks_expr}"
-                uid = hashlib.sha1(uid_seed.encode("utf-8")).hexdigest() + "@curriculum"
+                uid_seed = (f"{course_name}|{teacher}|{classroom}|"
+                            f"{day_date.isoformat()}|{start_p}-{end_p}|"
+                            f"{weeks_expr}")
+                uid = hashlib.sha1(uid_seed.encode()).hexdigest() \
+                    + "@curriculum"
+
                 events.append((dt_start, {
                     "uid": uid,
                     "start": dt_start,
                     "end": dt_end,
-                    "summary": summary,
-                    "location": location,
+                    "summary": course_name,
+                    "location": classroom or "待定教室",
                     "description": desc,
                 }))
 
@@ -804,7 +603,7 @@ def build_ics(config: Config) -> Tuple[str, int]:
         "PRODID:-//Anfyya//Curriculum Sync//CN",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
-        f"X-WR-CALNAME:{ics_escape(config.calendar_name)}",
+        f"X-WR-CALNAME:{ics_escape(calendar_name)}",
         "X-WR-TIMEZONE:Asia/Shanghai",
         "BEGIN:VTIMEZONE",
         "TZID:Asia/Shanghai",
@@ -822,8 +621,10 @@ def build_ics(config: Config) -> Tuple[str, int]:
             "BEGIN:VEVENT",
             f"UID:{ev['uid']}",
             f"DTSTAMP:{dtstamp}",
-            f"DTSTART;TZID=Asia/Shanghai:{ev['start'].strftime('%Y%m%dT%H%M%S')}",
-            f"DTEND;TZID=Asia/Shanghai:{ev['end'].strftime('%Y%m%dT%H%M%S')}",
+            f"DTSTART;TZID=Asia/Shanghai:"
+            f"{ev['start'].strftime('%Y%m%dT%H%M%S')}",
+            f"DTEND;TZID=Asia/Shanghai:"
+            f"{ev['end'].strftime('%Y%m%dT%H%M%S')}",
             f"SUMMARY:{ics_escape(ev['summary'])}",
             f"LOCATION:{ics_escape(ev['location'])}",
             f"DESCRIPTION:{ics_escape(ev['description'])}",
@@ -831,25 +632,65 @@ def build_ics(config: Config) -> Tuple[str, int]:
         ])
 
     lines.append("END:VCALENDAR")
-    ics_text = "\r\n".join(lines) + "\r\n"
-    return ics_text, len(events)
+    return "\r\n".join(lines) + "\r\n", len(events)
 
+
+# ---------------------------------------------------------------------------
+#  主函数
+# ---------------------------------------------------------------------------
 
 def main() -> int:
-    # 确保 print 实时输出（GitHub Actions 默认全缓冲）
-    sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, "reconfigure") else None
-    sys.stderr.reconfigure(line_buffering=True) if hasattr(sys.stderr, "reconfigure") else None
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(line_buffering=True)
 
     try:
-        cfg = build_config()
-        print(f"配置加载完成，origin={urllib.parse.urlsplit(cfg.entry_url).netloc}")
-        ics_text, count = build_ics(cfg)
-        with open(cfg.output_path, "w", encoding="utf-8", newline="") as f:
+        import ddddocr  # noqa: F811
+    except ImportError:
+        print("缺少 ddddocr，请先运行: pip install ddddocr", file=sys.stderr)
+        return 1
+
+    username = os.getenv("SSO_USERNAME", "").strip()
+    password = os.getenv("SSO_PASSWORD", "").strip()
+    if not username or not password:
+        print("缺少环境变量: SSO_USERNAME 和 SSO_PASSWORD", file=sys.stderr)
+        return 1
+
+    output_path = os.getenv("CURRICULUM_OUTPUT", "curriculum.ics")
+    calendar_name = os.getenv("CURRICULUM_CALENDAR_NAME", "课程表")
+    period_map = load_period_map()
+
+    try:
+        ocr = ddddocr.DdddOcr(show_ad=False)
+
+        print("Phase 1: 门户认证...")
+        cj = portal_auth(username, password, ocr)
+
+        print("Phase 2: SPA 认证 + 数据抓取...")
+        semester_info, all_weeks, schedule_data = \
+            fetch_schedule_data(cj, username, password, ocr)
+        print(f"  学期: {semester_info.get('semester')}")
+        print(f"  周次: {all_weeks}")
+        course_count = sum(
+            len(item.get("courseList", []))
+            for item in schedule_data)
+        print(f"  课程条目: {course_count}")
+
+        print("Phase 3: 生成 ICS...")
+        ics_text, count = generate_ics(
+            semester_info, all_weeks, schedule_data,
+            period_map, calendar_name)
+
+        with open(output_path, "w", encoding="utf-8", newline="") as f:
             f.write(ics_text)
-        print(f"已生成 {cfg.output_path}，事件数: {count}")
+        print(f"已生成 {output_path}，事件数: {count}")
         return 0
+
     except Exception as e:
         print(f"同步失败: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
         return 1
 
 

@@ -1,0 +1,7 @@
+claudefound.md
+*.bak
+*.bak2
+captured_data.json
+wp_debug.js
+__pycache__/
+*.pyc
