@@ -3,10 +3,8 @@ name: Sync Curriculum ICS
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 23 * * 0-4"  # 北京时间工作日 07:30
-    - cron: "0 5 * * 1-5"    # 北京时间工作日 13:00
-    - cron: "0 10 * * 1-5"   # 北京时间工作日 18:00
-    - cron: "0 15 * * 1-5"   # 北京时间工作日 23:00
+    - cron: "0 0 * * *"      # BJT daily 08:00
+    - cron: "30 5 * * *"     # BJT daily 13:30
 
 permissions:
   contents: write
