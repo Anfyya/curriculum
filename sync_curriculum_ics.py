@@ -57,10 +57,8 @@ DEFAULT_PERIOD_TIMES = {
 PERIOD_RANGE_OVERRIDES: Dict[Tuple[int, int], Tuple[str, str]] = {
     (1, 2): ("08:30", "09:55"),
     (3, 4): ("10:15", "11:40"),
-    (5, 6): ("14:00", "15:24"),
+    (5, 6): ("14:00", "15:25"),
     (7, 8): ("15:45", "17:10"),
-    (1, 4): ("08:30", "11:40"),
-    (5, 8): ("14:00", "17:10"),
 }
 
 # dayOfWeek: 2=Mon ... 7=Sat, 1=Sun -> Python weekday offset (Mon=0)
@@ -100,6 +98,7 @@ def _rsa_encrypt_block(plaintext: str) -> str:
 def _solve_captcha_expr(text: str) -> str:
     text = text.strip().rstrip("=").strip()
     text = text.replace("\u00d7", "*").replace("x", "*").replace("X", "*").replace("\u00f7", "/")
+    text = text.replace("o", "0").replace("O", "0")
     try:
         return str(int(eval(text, {"__builtins__": {}})))
     except Exception:
@@ -155,6 +154,10 @@ def parse_weeks_expr(expr: str, max_week: int) -> List[int]:
     return sorted(out)
 
 
+# 按大节拆分：每两节一段，连上 4 节也拆成两条
+PERIOD_BREAK_AFTER = {2, 4, 6, 8, 10, 12}
+
+
 def merge_periods(periods: Iterable[int]) -> List[Tuple[int, int]]:
     arr = sorted(set(p for p in periods if p > 0))
     if not arr:
@@ -162,7 +165,7 @@ def merge_periods(periods: Iterable[int]) -> List[Tuple[int, int]]:
     merged = []
     s = e = arr[0]
     for p in arr[1:]:
-        if p == e + 1:
+        if p == e + 1 and e not in PERIOD_BREAK_AFTER:
             e = p
         else:
             merged.append((s, e))
@@ -372,51 +375,14 @@ def fetch_schedule_data(cj: http.cookiejar.CookieJar, username: str,
                   wait_until="domcontentloaded")
         time.sleep(1)
 
-        # 导航到 SSO 登录页
-        page.goto(
-            f"{_SSO_ORIGIN}/lyuapServer/login"
-            f"?service={urllib.parse.quote(_CAS_SERVICE, safe='')}",
-            timeout=30000)
-
-        # 在浏览器中完成 SSO 登录
-        jw_ticket = None
-        for attempt in range(8):
-            r = page.evaluate(
-                "async()=>{const r=await fetch("
-                "'/lyuapServer/kaptcha?uid=&sf_request_type=ajax');"
-                "return await r.json()}")
-            img_b64 = r.get("content", "").split(",", 1)[-1]
-            raw_text = ocr.classification(base64.b64decode(img_b64))
-            code = _solve_captcha_expr(raw_text)
-            uid = r.get("uid", "")
-            print(f"  浏览器 SSO 尝试 {attempt + 1}/8: "
-                  f"OCR={raw_text!r} -> {code}")
-
-            lr = page.evaluate(
-                f"async()=>{{const f=new URLSearchParams({{"
-                f"username:'{username}',"
-                f"password:'{encrypted_pwd}',"
-                f"service:'{_CAS_SERVICE}',"
-                f"loginType:'',id:'{uid}',code:'{code}',otpcode:''}});"
-                f"const r=await fetch("
-                f"'/lyuapServer/v1/tickets?sf_request_type=ajax',"
-                f"{{method:'POST',headers:"
-                f"{{'Content-Type':'application/x-www-form-urlencoded'}},"
-                f"body:f.toString()}});return await r.json()}}")
-
-            ticket = lr.get("ticket") or lr.get("data", {})
-            if isinstance(ticket, dict):
-                if ticket.get("code") == "CODEFALSE":
-                    continue
-                ticket = ticket.get("ticket", "")
-            if ticket and str(ticket).startswith("ST-"):
-                jw_ticket = str(ticket)
-                break
-
-        if not jw_ticket:
-            browser.close()
-            raise RuntimeError("浏览器 SSO 登录失败")
-        print("  浏览器 SSO ticket 获取成功")
+        # SSO 登录（urllib，干净会话）-> 教务 ticket
+        # 2026-09 教务系统维护上线后，在浏览器内 fetch /v1/tickets 一律返回
+        # HTTP 500「系统内部错误」，而同样的请求走 urllib 正常，故改为 urllib 获取。
+        sso_opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=_build_ssl_context()))
+        jw_ticket = _sso_login(sso_opener, ocr, encrypted_pwd, username,
+                               _CAS_SERVICE)
+        print("  教务 SSO ticket 获取成功")
 
         # 路由拦截：将课表请求修改为查询全部周次
         captured: Dict[str, str] = {}
@@ -523,8 +489,10 @@ def generate_ics(semester_info: dict, all_weeks: List[int],
                 continue
             rows.append(course)
 
-    # 按 (课程, 教师, 教室, dayOfWeek, 周次, 班级) 分组合并节次
-    grouped: Dict[Tuple, set] = {}
+    # 按 (课程, 教室, 班级, 日期) 分组合并节次。
+    # 同一时段多位教师（如实训）会各返回一条、周次写法也不同，
+    # 因此先展开到具体日期，再合并节次、汇总教师。
+    grouped: Dict[Tuple, dict] = {}
     for r in rows:
         dow = int(r.get("dayOfWeek", 0))
         offset = DAY_OFFSET_MAP.get(dow)
@@ -543,12 +511,6 @@ def generate_ics(semester_info: dict, all_weeks: List[int],
         if not periods:
             continue
 
-        key = (course_name, teacher, classroom, offset, weeks_expr, class_name)
-        grouped.setdefault(key, set()).update(periods)
-
-    events = []
-    for (course_name, teacher, classroom, offset, weeks_expr, class_name), \
-            period_set in grouped.items():
         week_nums = parse_weeks_expr(weeks_expr, max_week)
         if not week_nums:
             try:
@@ -556,43 +518,53 @@ def generate_ics(semester_info: dict, all_weeks: List[int],
             except ValueError:
                 continue
 
-        period_ranges = merge_periods(period_set)
         for wn in week_nums:
             day_date = week1_monday + timedelta(days=offset + (wn - 1) * 7)
-            for start_p, end_p in period_ranges:
-                st_s, et_s = period_range_time(start_p, end_p, period_map)
-                h1, m1 = st_s.split(":")
-                h2, m2 = et_s.split(":")
-                dt_start = datetime(day_date.year, day_date.month, day_date.day,
-                                    int(h1), int(m1), tzinfo=TZ_CST)
-                dt_end = datetime(day_date.year, day_date.month, day_date.day,
-                                  int(h2), int(m2), tzinfo=TZ_CST)
-                if dt_end <= dt_start:
-                    dt_end += timedelta(days=1)
+            key = (course_name, classroom, class_name, day_date)
+            g = grouped.setdefault(key, {"periods": set(), "teachers": [],
+                                         "week": wn})
+            g["periods"].update(periods)
+            for t in teacher.split("、") if teacher else []:
+                if t not in g["teachers"]:
+                    g["teachers"].append(t)
 
-                desc = "\n".join([
-                    f"教师: {teacher or '待定'}",
-                    f"班级: {class_name or '待定'}",
-                    f"周次: {weeks_expr}",
-                    f"节次: 第{start_p}-{end_p}节",
-                    f"学期: {semester}",
-                    "来源: 江西工程学院课程系统",
-                ])
+    events = []
+    for (course_name, classroom, class_name, day_date), g in grouped.items():
+        teacher = "、".join(g["teachers"])
+        wn = g["week"]
+        for start_p, end_p in merge_periods(g["periods"]):
+            st_s, et_s = period_range_time(start_p, end_p, period_map)
+            h1, m1 = st_s.split(":")
+            h2, m2 = et_s.split(":")
+            dt_start = datetime(day_date.year, day_date.month, day_date.day,
+                                int(h1), int(m1), tzinfo=TZ_CST)
+            dt_end = datetime(day_date.year, day_date.month, day_date.day,
+                              int(h2), int(m2), tzinfo=TZ_CST)
+            if dt_end <= dt_start:
+                dt_end += timedelta(days=1)
 
-                uid_seed = (f"{course_name}|{teacher}|{classroom}|"
-                            f"{day_date.isoformat()}|{start_p}-{end_p}|"
-                            f"{weeks_expr}")
-                uid = hashlib.sha1(uid_seed.encode()).hexdigest() \
-                    + "@curriculum"
+            desc = "\n".join([
+                f"教师: {teacher or '待定'}",
+                f"班级: {class_name or '待定'}",
+                f"周次: 第{wn}周",
+                f"节次: 第{start_p}-{end_p}节",
+                f"学期: {semester}",
+                "来源: 江西工程学院课程系统",
+            ])
 
-                events.append((dt_start, {
-                    "uid": uid,
-                    "start": dt_start,
-                    "end": dt_end,
-                    "summary": course_name,
-                    "location": classroom or "待定教室",
-                    "description": desc,
-                }))
+            uid_seed = (f"{course_name}|{classroom}|{class_name}|"
+                        f"{day_date.isoformat()}|{start_p}-{end_p}")
+            uid = hashlib.sha1(uid_seed.encode()).hexdigest() \
+                + "@curriculum"
+
+            events.append((dt_start, {
+                "uid": uid,
+                "start": dt_start,
+                "end": dt_end,
+                "summary": course_name,
+                "location": classroom or "待定教室",
+                "description": desc,
+            }))
 
     events.sort(key=lambda x: x[0])
     dtstamp = datetime.now(TZ_UTC).strftime("%Y%m%dT%H%M%SZ")

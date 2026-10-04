@@ -5,3 +5,4 @@ captured_data.json
 wp_debug.js
 __pycache__/
 *.pyc
+.env.local
